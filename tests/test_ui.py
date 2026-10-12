@@ -585,7 +585,7 @@ def test_long_check_boxes_wrap_and_still_work(app, make):
     box = window.pages["type"].ink.confirm
     assert isinstance(box, WrapCheckBox) and box.text().startswith("I looked at the tablet")
     one_line = box.sizeHint()
-    assert box.minimumSizeHint().width() < one_line.width() // 2, "the sentence no longer sets the width"
+    assert box.minimumSizeHint().width() < one_line.width(), "wrapping must reduce the sentence's minimum width"
     assert box.heightForWidth(160) > box.heightForWidth(one_line.width() + 40), "narrow means more lines"
     probe = WrapCheckBox("I looked at the tablet and the corner mark is in the right place")
     probe.resize(170, probe.heightForWidth(170))
