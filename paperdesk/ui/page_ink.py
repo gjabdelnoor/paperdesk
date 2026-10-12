@@ -14,11 +14,11 @@ from typing import Any
 
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLineEdit, QProgressBar,
+from PySide6.QtWidgets import (QComboBox, QGridLayout, QHBoxLayout, QLineEdit, QProgressBar,
                                QSpinBox, QVBoxLayout, QWidget)
 
 from .services import INK_PREPARE, INK_PROBE, INK_STREAM, accepts, describe_error, method
-from .widgets import Card, button, flow, label, set_role
+from .widgets import Card, WrapCheckBox, button, flow, label, pair, set_role
 
 FIGURE_FILTER = "Figures (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.svg);;All files (*)"
 MODES = [("diagram", "Diagram — outlines of dark shapes"), ("photo", "Photo — edges only"),
@@ -71,10 +71,11 @@ class InkPanel(QWidget):
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
-        grid.addWidget(label("Placement", None, wrap=False), 0, 0)
+        grid.addWidget(label("Placement", None, wrap=False), 0, 0, Qt.AlignmentFlag.AlignTop)
         self.edges: list[QSpinBox] = []
-        place = QHBoxLayout()
-        place.setSpacing(6)
+        # Each caption stays with its box, and the row wraps: four spin boxes side by side were
+        # the widest thing on the whole Type page, and set its width even while out of sight.
+        place = []
         for name, value in zip(EDGES, (1000, 1000, 9000, 9000)):
             spin = QSpinBox()
             spin.setRange(0, 10000)
@@ -83,13 +84,9 @@ class InkPanel(QWidget):
             spin.setAccessibleName(f"Placement {name.lower()} edge")
             spin.setToolTip(f"{name} edge of the area, from 0 to 10000 across the page")
             spin.valueChanged.connect(self._changed)
-            place.addWidget(label(name, "caption", wrap=False))
-            place.addWidget(spin)
+            place.append(pair(name, spin))
             self.edges.append(spin)
-        place.addStretch(1)
-        grid.addLayout(place, 0, 1)
-        tune = QHBoxLayout()
-        tune.setSpacing(6)
+        grid.addWidget(flow(*place, spacing=10), 0, 1)
         self.threshold = QSpinBox()
         self.threshold.setRange(1, 254)
         self.threshold.setValue(160)
@@ -107,12 +104,9 @@ class InkPanel(QWidget):
         self.threshold.valueChanged.connect(self._changed)
         self.resolution.valueChanged.connect(self._changed)
         self.mode.currentIndexChanged.connect(self._changed)
-        for text, widget in (("Threshold", self.threshold), ("Resolution", self.resolution)):
-            tune.addWidget(label(text, "caption", wrap=False))
-            tune.addWidget(widget)
-        tune.addWidget(self.mode, 1)
-        grid.addWidget(label("Tracing", None, wrap=False), 1, 0)
-        grid.addLayout(tune, 1, 1)
+        grid.addWidget(label("Tracing", None, wrap=False), 1, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(flow(pair("Threshold", self.threshold), pair("Resolution", self.resolution),
+                            self.mode, spacing=10), 1, 1)
         grid.setColumnStretch(1, 1)
         figure.body.addLayout(grid)
         figure.add(label("Placement runs from 0 to 10000 across and down the page. The figure keeps its "
@@ -144,7 +138,7 @@ class InkPanel(QWidget):
         self.mark_button.clicked.connect(self.draw_mark)
         self.mark_note = label("", "muted")
         self.mark_note.setAccessibleName("Calibration mark result")
-        self.confirm = QCheckBox("I looked at the tablet and the corner mark is in the right place")
+        self.confirm = WrapCheckBox("I looked at the tablet and the corner mark is in the right place")
         self.confirm.setAccessibleName("Calibration mark inspected on the tablet")
         self.confirm.setAccessibleDescription("The mark sits at the top-left of the area where the figure "
                                               "should go, on the right page")

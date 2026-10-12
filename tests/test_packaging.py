@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
+import plistlib
 
 import pytest
 
@@ -264,3 +265,21 @@ def test_tracked_document_symlink_cannot_copy_an_unrelated_file(tmp_path, monkey
     monkeypatch.setattr(build.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout="docs/escape.md\0"))
     with pytest.raises(RuntimeError, match="escapes docs"):
         build.copy_public_docs(root, tmp_path / "bundle/docs")
+
+
+def test_macos_release_metadata_matches_project_and_preserves_native_settings(tmp_path):
+    from paperdesk import __version__
+
+    bundle = tmp_path / "PaperDesk.app"
+    path = bundle / "Contents/Info.plist"
+    path.parent.mkdir(parents=True)
+    original = {"CFBundleShortVersionString": "0.0.0", "CFBundleIdentifier": "PaperDesk",
+                "CFBundleExecutable": "PaperDesk", "NSHighResolutionCapable": True}
+    path.write_bytes(plistlib.dumps(original, fmt=plistlib.FMT_BINARY))
+    report = {}
+    build.update_macos_metadata(bundle, report)
+    metadata = plistlib.loads(path.read_bytes())
+    assert metadata["CFBundleShortVersionString"] == metadata["CFBundleVersion"] == __version__
+    assert metadata["CFBundleIdentifier"] == "io.github.gjabdelnoor.paperdesk"
+    assert metadata["CFBundleExecutable"] == "PaperDesk" and metadata["NSHighResolutionCapable"] is True
+    assert report["bundle_metadata"]["CFBundleShortVersionString"] == __version__

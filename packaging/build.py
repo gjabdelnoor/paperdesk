@@ -12,6 +12,7 @@ import importlib.metadata
 import json
 import re
 import hashlib
+import plistlib
 
 
 OPENSSL_DYLIB = re.compile(r"^lib(ssl|crypto)\.(\d+(?:\.\d+)*)\.dylib$")
@@ -189,6 +190,19 @@ def sign_macos_bundle(bundle, report):
     }
 
 
+def update_macos_metadata(bundle, report):
+    """Set release identity before the final bundle signature is sealed."""
+    from paperdesk import __version__
+
+    path = bundle / "Contents/Info.plist"
+    metadata = plistlib.loads(path.read_bytes())
+    identity = {"CFBundleShortVersionString": __version__, "CFBundleVersion": __version__,
+                "CFBundleIdentifier": "io.github.gjabdelnoor.paperdesk"}
+    metadata.update(identity)
+    path.write_bytes(plistlib.dumps(metadata, fmt=plistlib.FMT_XML))
+    report["bundle_metadata"] = identity
+
+
 def copy_macos_openssl_licenses(destination, report):
     """Copy original licensing from the selected library's installation prefix."""
     selected = report["selected_binaries"]
@@ -305,6 +319,7 @@ def main():
     copy_public_docs(root, bundle / ("Contents/Resources/docs" if sys.platform == "darwin" else "docs"))
     if sys.platform == "darwin":
         try:
+            update_macos_metadata(bundle, macos_report)
             inspect_macos_bundle(bundle, macos_report)
             copy_macos_openssl_licenses(bundle / "Contents/Resources/licenses/OpenSSL", macos_report)
             sign_macos_bundle(bundle, macos_report)

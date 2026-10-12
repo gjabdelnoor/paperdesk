@@ -69,8 +69,11 @@ Anyone without a tablet at hand presses **Try the simulator** and can walk the s
 - **Selection and focus.** The selected page has a paper pill, an accent bar and bolder text.
   Keyboard focus draws a 2 px accent ring; mouse clicks do not leave rings behind.
 - **Motion.** None. No spinners, no timers, no polling; the idle application does nothing.
-- **Reflow.** Button rows and section tabs wrap; every page scrolls vertically. Designed at
-  900 × 650 and upward.
+- **Reflow.** Button rows, section tabs, rows of small controls and long check-box sentences
+  wrap; every page scrolls vertically and none sideways. Designed at 900 × 650 and upward, with
+  room left for the larger fonts and controls of other desktops. Sections are stacked, and a
+  stack is as wide as its widest pane even when that pane is out of sight, so no pane may hold
+  a row that cannot shrink.
 
 ## Decisions
 

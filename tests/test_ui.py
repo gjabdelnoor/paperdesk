@@ -7,6 +7,7 @@ PAPERDESK_UI_SHOTS=<directory> to also save a screenshot of every page.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -15,15 +16,18 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings  # noqa: E402
-from PySide6.QtGui import QColor, QGuiApplication, QImage  # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QScrollArea  # noqa: E402
+from PySide6.QtCore import QPoint, QSettings, Qt  # noqa: E402
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
+from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QScrollArea, QStyleFactory,  # noqa: E402
+                               QWidget)
 
 from paperdesk.models import DeviceConfig  # noqa: E402
 from paperdesk.ui import MainWindow, create_window  # noqa: E402
 from paperdesk.ui.main_window import SHORTCUTS  # noqa: E402
 from paperdesk.ui.page_library import UPLOAD_FILTER  # noqa: E402
 from paperdesk.ui.services import ServiceProvider  # noqa: E402
+from paperdesk.ui.widgets import WrapCheckBox  # noqa: E402
 
 FINGERPRINT = "SHA256:Zk3vQ0m1r8yJ4uXbT2sLw9aHnE6cPdF5gKoR7iVtUxA"
 FEATURE_IDS = ("keyboard", "touch", "direct-paste", "art-display")
@@ -453,6 +457,48 @@ def test_navigation_reaches_every_page_and_section(app, make):
     assert menus == ["File", "Tablet", "View", "Help"]
 
 
+def _needs(widget) -> int:
+    return max(widget.minimumSizeHint().width(), widget.minimumWidth())
+
+
+def layout_report(app, window, page, name: str) -> str:
+    """Bounded account of what makes a page too wide, for a failing layout assertion.
+
+    A stacked section takes the minimum width of its widest pane, shown or not, so every pane
+    is listed, with the innermost widgets that will not shrink.  A picture of the window is
+    saved beside it.  Nothing here touches a device.
+    """
+    lines = [f"platform {sys.platform}, style {app.style().objectName()}, font "
+             f"{app.font().family()} {app.font().pointSizeF():.1f}pt, window {window.width()}x{window.height()}"]
+    for area in page.findChildren(QScrollArea):
+        if area.isVisible() and area.widget() is not None:
+            room = area.viewport().width()
+            lines.append(f"viewport {room}px, content needs {_needs(area.widget())}px, "
+                         f"sideways scroll range {area.horizontalScrollBar().maximum()}px")
+            break
+    else:
+        room = window.width()
+    sections = getattr(page, "sections", None)
+    panes = [(section, sections.stack.widget(index)) for index, section in enumerate(sections.ids())] \
+        if sections else [("page", page)]
+    for section, pane in panes:
+        lines.append(f"  pane {section}: needs {_needs(pane)}px" + ("" if pane.isVisible() else " (stacked out of sight)"))
+        rigid = [(_needs(child), type(child).__name__, child.accessibleName() or child.objectName())
+                 for child in pane.findChildren(QWidget)
+                 if _needs(child) > room // 2
+                 and not any(_needs(inner) > room // 2 for inner in child.findChildren(QWidget))]
+        lines += [f"    {width}px {kind} {text!r}" for width, kind, text in sorted(rigid, reverse=True)[:5]]
+    folder = Path("evidence") / ("" if os.environ.get("CI") else "local") / "layout-failures"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        picture = folder / f"{sys.platform}-{name}.png"
+        if window.grab().save(str(picture)):
+            lines.append(f"picture: {picture}")
+    except OSError as error:
+        lines.append(f"no picture: {error}")
+    return "\n".join(lines[:60])
+
+
 def test_no_page_needs_sideways_scrolling_at_the_smallest_supported_size(app, make):
     window, _service = demo_window(app, make)
     for size in ((900, 650), (1180, 800)):
@@ -466,7 +512,66 @@ def test_no_page_needs_sideways_scrolling_at_the_smallest_supported_size(app, ma
                     app.processEvents()
                 wide = [area for area in page.findChildren(QScrollArea)
                         if area.isVisible() and area.horizontalScrollBar().maximum() > 0]
-                assert not wide, f"{page_id}/{section} is wider than a {size[0]} pixel window"
+                assert not wide, (f"{page_id}/{section} is wider than a {size[0]} pixel window\n"
+                                  + layout_report(app, window, page, f"{size[0]}-{page_id}-{section}"))
+
+
+@pytest.mark.parametrize("style, scale", [("", 1.2), ("Fusion", 1.35), ("Windows", 1.35)])
+def test_pages_fit_900_pixels_with_larger_fonts_and_other_widget_styles(app, make, style, scale):
+    """Linux metrics are the narrowest we meet.  Leave room for the fonts and controls of the
+    other desktops, counting panes that are stacked out of sight, which still set the width."""
+    old_font, old_style = QFont(app.font()), app.style().objectName()
+    font = QFont(old_font)
+    font.setPointSizeF(old_font.pointSizeF() * scale)
+    try:
+        if style:
+            app.setStyle(QStyleFactory.create(style))
+        app.setFont(font)
+        window, _service = demo_window(app, make)
+        window.resize(900, 650)
+        window.show()
+        for page_id, page in window.pages.items():
+            sections = getattr(page, "sections", None)
+            for section in (sections.visible_ids() if sections else [None]):
+                window.navigate(page_id, section)
+                for _ in range(4):
+                    app.processEvents()
+                for area in page.findChildren(QScrollArea):
+                    if area.isVisible():
+                        fits = (area.horizontalScrollBar().maximum() == 0
+                                and _needs(area.widget()) <= area.viewport().width())
+                        assert fits, (f"{page_id}/{section} does not fit 900 pixels at {scale}x font, "
+                                      f"style {style or 'default'}\n"
+                                      + layout_report(app, window, page, f"stress-{style}-{page_id}-{section}"))
+        window.close()
+    finally:
+        app.setFont(old_font)
+        if style:
+            app.setStyle(QStyleFactory.create(old_style))
+
+
+def test_long_check_boxes_wrap_and_still_work(app, make):
+    window, _service = demo_window(app, make)
+    window.resize(900, 650)
+    window.show()
+    window.navigate("type", "ink")
+    for _ in range(4):
+        app.processEvents()
+    box = window.pages["type"].ink.confirm
+    assert isinstance(box, WrapCheckBox) and box.text().startswith("I looked at the tablet")
+    one_line = box.sizeHint()
+    assert box.minimumSizeHint().width() < one_line.width() // 2, "the sentence no longer sets the width"
+    assert box.heightForWidth(160) > box.heightForWidth(one_line.width() + 40), "narrow means more lines"
+    probe = WrapCheckBox("I looked at the tablet and the corner mark is in the right place")
+    probe.resize(170, probe.heightForWidth(170))
+    probe.show()
+    assert not probe.isChecked()
+    QTest.mouseClick(probe, Qt.MouseButton.LeftButton, pos=QPoint(120, probe.height() - 6))
+    assert probe.isChecked(), "a click on the last wrapped line still ticks the box"
+    QTest.keyClick(probe, Qt.Key.Key_Space)
+    assert not probe.isChecked()
+    assert not probe.grab().toImage().isNull()
+    probe.close()
 
 
 def test_try_the_simulator_from_a_disconnected_window(app, make):
@@ -775,6 +880,22 @@ def test_worker_teardown_is_clean_even_with_work_in_flight(app, make):
     assert service.calls[-1] == ("disconnect",) and not service.connected
     assert window.run("status", lambda s: s.status(), label="late") is False
     assert window.shutdown() is True
+
+
+def test_pdf_export_is_available_without_active_page_extension(app, make, tmp_path):
+    window, service = demo_window(app, make)
+    window._status["active_document"] = {}
+    window._refresh()
+    library = window.pages["library"]
+    assert library.export_button.isEnabled()
+    assert "recent" in library.export_button.text()
+    assert "uniquely" in library.current_label.text()
+    destination = tmp_path / "most-recent.pdf"
+    window.dialogs.save_path = str(destination)
+    library.export_button.click()
+    settle(app, window)
+    assert service.calls[-1] == ("export_current", str(destination))
+    assert destination.read_bytes().startswith(b"%PDF-")
 
 
 def test_image_sticker_upload_and_setup_link_for_missing_extras(app, make, tmp_path):

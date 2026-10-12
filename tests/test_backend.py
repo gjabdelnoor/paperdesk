@@ -35,6 +35,25 @@ def document_inventory(name="existing", ident=DOCUMENT):
     return {ident: {"id":ident, "name":name, "type":"pdf", "pages":1, "parent":"", "modified":0}}
 
 
+def test_stopped_copy_pass_never_starts_the_next_import_or_export(tmp_path):
+    service = physical_mock(tmp_path)
+    local = tmp_path / "files"
+    local.mkdir()
+    for name in ("first.pdf", "second.pdf"):
+        (local / name).write_bytes(b"%PDF-1.4 synthetic local fixture")
+    copied = []
+    def first(path):
+        copied.append(Path(path).name)
+        service.cancel_current()
+        return {"ok": True}
+    service.upload = first
+    service.documents = Mock(side_effect=AssertionError("Stopped pass must not start exports"))
+    with pytest.raises(DeviceError, match="copy pass was stopped"):
+        service.sync(str(local))
+    assert copied == ["first.pdf"]
+    assert not (local / "device-copies").exists()
+
+
 def test_startup_is_disconnected_and_does_not_contact_tablet(tmp_path, monkeypatch):
     connect = Mock(side_effect=AssertionError("Unexpected physical connection"))
     monkeypatch.setattr("paperdesk.transport.SSHTransport.connect", connect)

@@ -1,7 +1,61 @@
 # Claude UI report
 
 Runtime model identifier: `claude-opus-5-5` (Claude Opus 5.5, Claude Code CLI). Date: 2026-10-12.
-Covers the interface as it stands after `contracts/CLAUDE_INTEGRATION.md`.
+Covers the interface as it stands after `contracts/CLAUDE_INTEGRATION.md` and the layout repair
+in `contracts/CLAUDE_WINDOWS_LAYOUT.md`.
+
+## Windows 900 × 650 layout repair (Claude)
+
+**Failure.** On native Windows CI,
+`test_no_page_needs_sideways_scrolling_at_the_smallest_supported_size` reported Type › Write as
+wider than a 900 pixel window.
+
+**Cause.** Write was not the wide pane. Type's sections sit in a stack, and a stack takes the
+minimum width of its widest pane whether or not that pane is showing. The widest was Figure as
+ink: its placement row put four captions and four spin boxes side by side in a layout that
+cannot wrap, and its one-line check box could not shrink either. Measured on Linux at 900
+pixels wide, the page had 690 pixels of room and needed 620, of which the ink pane was 564; so
+there were 70 pixels to spare, and Windows fonts and spin boxes used them up. The test names
+Write only because it is the first Type section it visits. Art was as close (629 of 690),
+because of three one-line check boxes, and would have been the next failure.
+
+Reproduced on Linux with the Windows widget style and a font 1.35 times larger: Type needed
+757 of 688 pixels (ink pane 701) and Art 799, its widest item a 705 pixel check box.
+
+**Fix.** Wrapping, not a wider window and not a hidden scroll bar.
+
+- `widgets.py`: `WrapCheckBox`, a check box whose sentence wraps onto further lines, with the
+  same API, keyboard handling and native indicator as a plain one, and the whole label
+  clickable. `pair()` keeps a caption with its control as one item of a wrapping row.
+- `page_ink.py`: the placement and tracing rows are wrapping rows of caption-and-control pairs;
+  the inspected-mark confirmation is a `WrapCheckBox`.
+- `page_art.py`: the macOS pen acknowledgement, touch, plugin-enabled and canvas-display boxes
+  are `WrapCheckBox`.
+- `page_setup.py`: the trust confirmation is a `WrapCheckBox`.
+- `page_type.py` was not edited. No input, clipboard, touch, worker or teardown code changed.
+
+**After.** Same stress (Windows style, 1.35×): Type needs 479 of 688 pixels, Art 452. At 1.6×
+with Fusion every page still fits; the tightest is Home at 598 of 690.
+
+**Tests.** The 900 × 650 test keeps its assertion unchanged; on failure it now also prints a
+bounded report (platform, style, font, viewport, every pane's minimum width including those
+stacked out of sight, the widgets that will not shrink) and saves a picture under
+`evidence/local/layout-failures/`, or `evidence/layout-failures/` when `CI` is set. New:
+`test_pages_fit_900_pixels_with_larger_fonts_and_other_widget_styles` (default style at 1.2×,
+Fusion and Windows styles at 1.35×; it requires both no sideways scroll range and a content
+minimum within the viewport) and `test_long_check_boxes_wrap_and_still_work`. The stress test
+was not run against the code before this repair; the before figures above come from a
+measuring script at the same style and font. Full suite on Linux: 309 passed, 1 skipped (the optional
+screenshot test); UI files with screenshots enabled: 60 passed. The counts in the Verification
+table further down are from the integration pass and are older.
+
+**Limits.** This was diagnosed and verified on Linux only. Qt's "Windows" style here is the
+classic one, not the native Windows 11 style, and the font was scaled rather than replaced by
+Segoe UI, so the stress is an approximation with margin, not a reproduction. The native CI run
+is the proof. `WrapCheckBox` paints its own indicator and text through the platform style; that
+was checked by eye on Linux in unchecked, checked and disabled states, and not on Windows or
+macOS. The "Placement" and "Tracing" captions now sit at the top of their rows, a few pixels
+above the centre line of the controls.
 
 ## Maintainer integration after Claude's review
 
@@ -12,11 +66,15 @@ now distinguishes Paper Pro developer mode from reMarkable 1/2 SSH access, and
 the empty-address Tailscale message asks for an address rather than a password.
 These are maintainer changes after the Claude contract, without a visual redesign.
 
-The assembled source passed 304 tests, with one optional screenshot-export test
+The assembled source passed 311 tests, with one optional screenshot-export test
 skipped. A separate Linux desktop launch used the active native X11 display and
 closed cleanly after capturing its simulated Home screen. This does not establish
 physical tablet behavior or accessibility quality. Final platform package results
 are recorded with the release.
+
+Library also exposes the backend's uniquely most-recent export fallback when the
+active-page extension is unavailable. Copy passes stop between files after a
+cancellation, preserving already confirmed copies and starting no further imports.
 
 ## Outcome
 

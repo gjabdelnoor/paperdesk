@@ -1125,12 +1125,18 @@ class SuiteService:
             raise DeviceError("Choose an existing local folder for the explicit sync pass.")
         imported = []
         for path in sorted(local.iterdir()):
+            if self._cancel_event.is_set():
+                raise DeviceError("The copy pass was stopped. Confirmed copies remain; no further imports or exports were started.")
             if path.is_file() and not path.is_symlink() and path.suffix.lower() in (".pdf", ".epub", ".rmdoc"):
                 imported.append(self.upload(str(path)))
+        if self._cancel_event.is_set():
+            raise DeviceError("The copy pass was stopped. Confirmed copies remain; no further exports were started.")
         exports = local / "device-copies" / time.strftime("%Y%m%d-%H%M%S")
         exports.mkdir(parents=True, exist_ok=False)
         copied = []
         for document in self.documents():
+            if self._cancel_event.is_set():
+                raise DeviceError("The copy pass was stopped. Confirmed copies remain; no further exports were started.")
             if document["type"] == "folder":
                 continue
             output = exports / f"{_safe_name(document['name'])}_{document['id'][:8]}.pdf"

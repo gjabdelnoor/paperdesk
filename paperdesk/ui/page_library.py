@@ -286,9 +286,11 @@ class LibraryPage(Page):
             pages = f" — page {doc.get('page')} of {doc.get('pages')}" if doc.get("pages") else ""
             self.current_label.setText(f"{doc['name']}{pages}")
         else:
-            self.current_label.setText("No document is open on the tablet." if connected
+            self.current_label.setText("The open document is not reported. Export uses the most recently "
+                                       "opened document when it can be identified uniquely." if connected
                                        else "Connect to a tablet to export its open document.")
-        self.export_button.setEnabled(has_doc and self.win.allows("export"))
+        self.export_button.setText("Export as PDF…" if has_doc else "Export recent as PDF…")
+        self.export_button.setEnabled(self.win.allows("export"))
         self.sync_choose.setEnabled(True)
         self.sync_button.setEnabled(self.win.allows("sync") and bool(self.sync_edit.text()))
         self._apply_filter()
@@ -329,15 +331,14 @@ class LibraryPage(Page):
         if not self._ready("export the open document"):
             return
         doc = self.win.status.get("active_document") or {}
-        if not (isinstance(doc, dict) and doc.get("name")):
-            self.win.notify("info", "No document is open on the tablet, so there is nothing to export.")
-            return
-        name = safe_name(str(doc["name"]))
-        destination = self.win.dialogs.save_file("Export open document as PDF", name + ".pdf",
+        has_doc = isinstance(doc, dict) and bool(doc.get("name"))
+        name = safe_name(str(doc["name"])) if has_doc else "most-recent-document"
+        destination = self.win.dialogs.save_file("Export open document as PDF" if has_doc
+                                                 else "Export most recently opened document as PDF", name + ".pdf",
                                                  "PDF documents (*.pdf)")
         if destination:
             self.win.run("export", lambda s: s.export_current(destination),
-                         label=f"Export {name} as PDF")
+                         label=f"Export {name} as PDF" if has_doc else "Export the most recently opened document as PDF")
 
     def choose_sync_folder(self) -> None:
         folder = self.win.dialogs.directory("Choose the folder for the copy pass")

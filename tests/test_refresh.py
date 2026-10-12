@@ -101,7 +101,7 @@ def test_detached_restore_trap_executes_on_success_and_failure_in_isolated_shell
     marker = sandbox / "receipt.json"
     command = command.replace("/sys/power/autosleep",shlex.quote(str(autosleep)))
     command = command.replace("/sys/bus/i2c/devices/1-0048/enable_nowait",shlex.quote(str(regulator)))
-    command = re.sub(r"/run/paperdesk-refresh-[0-9a-f]{32}\.json",str(marker),command)
+    command = re.sub(r"/run/paperdesk-refresh-[0-9a-f]{32}\.json", lambda _: shlex.quote(str(marker)),command)
     # Guard against accidentally running any hardware command from the source.
     assert "/sys/" not in command and "/run/" not in command
     tools = sandbox / "bin"; tools.mkdir()

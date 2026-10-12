@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QButtonGroup, QCheckBox, QComboBox, QGridLayout, Q
 
 from .services import (ART_APPLICATIONS, ART_PLUGIN, ART_PLUGIN_PLAN, ART_PROGRAM, accepts, describe_error,
                        method)
-from .widgets import Card, DataView, Page, button, flow, label, set_role
+from .widgets import Card, DataView, Page, WrapCheckBox, button, flow, label, set_role
 
 APPS = [("krita", "Krita", "Painting and illustration"), ("inkscape", "Inkscape", "Vector drawing"),
         ("blender", "Blender", "3D and Grease Pencil")]
@@ -137,7 +137,7 @@ class ArtPage(Page):
         self.mode_help = label("", "caption")
         self.mode_help.setAccessibleName("Input method explanation")
         tune.addWidget(self.mode_help, 1, 1, 1, 2)
-        self.mac_pen_ack = QCheckBox("I understand macOS pen pressure is experimental and unverified")
+        self.mac_pen_ack = WrapCheckBox("I understand macOS pen pressure is experimental and unverified")
         self.mac_pen_ack.setAccessibleName("Accept experimental macOS pen pressure")
         self.mac_pen_ack.toggled.connect(self.refresh_state)
         tune.addWidget(self.mac_pen_ack, 2, 1, 1, 2)
@@ -171,7 +171,7 @@ class ArtPage(Page):
         tune.addWidget(self.eraser_check, 7, 0)
         tune.addLayout(eraser_row, 7, 1, 1, 2)
         mode.body.addLayout(tune)
-        self.touch_check = QCheckBox("Forward touch gestures (pan, zoom, rotate)")
+        self.touch_check = WrapCheckBox("Forward touch gestures (pan, zoom, rotate)")
         self.touch_check.setAccessibleName("Forward touch gestures")
         mode.add(self.touch_check)
         self.touch_note = mode.add(label("", "caption"))
@@ -214,7 +214,7 @@ class ArtPage(Page):
         card.add(flow(self.plugin_plan_button, self.plugin_button, self.plugin_replace_button))
         self.plugin_note = card.add(label("", "muted"))
         self.plugin_note.setAccessibleName("Krita plugin state")
-        self.plugin_ready = QCheckBox("I enabled reMarkable Viewport in Krita's Python Plugin Manager and "
+        self.plugin_ready = WrapCheckBox("I enabled reMarkable Viewport in Krita's Python Plugin Manager and "
                                       "restarted Krita myself")
         self.plugin_ready.setAccessibleName("Krita plugin enabled and Krita restarted")
         self.plugin_ready.toggled.connect(self.refresh_state)
@@ -231,7 +231,7 @@ class ArtPage(Page):
         probe.addWidget(self.plugin_check_button, 0, Qt.AlignmentFlag.AlignTop)
         probe.addWidget(self.plugin_probe_note, 1)
         card.body.addLayout(probe)
-        self.display_check = QCheckBox("Show the Krita canvas on the tablet when tablet mode starts")
+        self.display_check = WrapCheckBox("Show the Krita canvas on the tablet when tablet mode starts")
         self.display_check.setAccessibleName("Show the Krita canvas on the tablet")
         self.display_check.toggled.connect(self.refresh_state)
         card.add(self.display_check)

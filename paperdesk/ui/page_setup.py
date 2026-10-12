@@ -13,7 +13,7 @@ from ..models import DeviceConfig
 from . import theme
 from .page_sandbox import SandboxPanel
 from .services import FEATURE_NAMES, FEATURES
-from .widgets import Card, DataView, Page, Sections, button, flow, label, set_role
+from .widgets import Card, DataView, Page, Sections, WrapCheckBox, button, flow, label, set_role
 
 _REFUSAL_KEYS = ("ok", "supported", "compatible", "allowed", "installable")
 
@@ -170,7 +170,7 @@ class ConnectPanel(QWidget):
         self.fingerprint.setAccessibleName("Host key fingerprint")
         self.trust_card.add(self.fingerprint)
         self.trust_advice = self.trust_card.add(label("", "muted"))
-        self.trust_check = QCheckBox("")
+        self.trust_check = WrapCheckBox("")
         self.trust_check.toggled.connect(self.refresh_state)
         self.trust_card.add(self.trust_check)
         self.trust_button = button("Trust this tablet and connect", "primary")

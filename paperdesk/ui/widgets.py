@@ -4,9 +4,10 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPen
-from PySide6.QtWidgets import (QAbstractButton, QButtonGroup, QFrame, QHBoxLayout, QLabel, QLayout,
-                               QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QTreeWidget,
+from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPalette, QPen
+from PySide6.QtWidgets import (QAbstractButton, QButtonGroup, QCheckBox, QFrame, QHBoxLayout, QLabel,
+                               QLayout, QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QStyle,
+                               QStyleOptionButton, QStyleOptionFocusRect, QStylePainter, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from . import theme
@@ -125,6 +126,88 @@ def flow(*widgets: QWidget, spacing: int = 8) -> QWidget:
     policy.setHeightForWidth(True)
     holder.setSizePolicy(policy)
     return holder
+
+
+def pair(text: str, widget: QWidget) -> QWidget:
+    """A caption and its control kept together as one item of a wrapping row."""
+    holder = QWidget()
+    row = QHBoxLayout(holder)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(6)
+    row.addWidget(label(text, "caption", wrap=False))
+    row.addWidget(widget)
+    return holder
+
+
+class WrapCheckBox(QCheckBox):
+    """A check box whose sentence wraps onto more lines instead of setting the page's width.
+
+    A plain QCheckBox is as wide as its whole label on one line, and that width becomes the
+    minimum of every layout above it, including panes that are stacked out of sight.
+    """
+
+    _FLAGS = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap
+                 | Qt.TextFlag.TextShowMnemonic)
+    _PAD = 2
+
+    def __init__(self, text: str = ""):
+        super().__init__(text)
+        policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def _indicator(self) -> tuple[QStyleOptionButton, int, int, int]:
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        style = self.style()
+        return (option, style.pixelMetric(QStyle.PixelMetric.PM_IndicatorWidth, option, self),
+                style.pixelMetric(QStyle.PixelMetric.PM_IndicatorHeight, option, self),
+                style.pixelMetric(QStyle.PixelMetric.PM_CheckBoxLabelSpacing, option, self))
+
+    def _text_size(self, room: int) -> QSize:
+        return self.fontMetrics().boundingRect(QRect(0, 0, max(room, 1), 100000), self._FLAGS,
+                                               self.text()).size()
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        _option, box, tall, gap = self._indicator()
+        return max(tall, self._text_size(width - box - gap).height()) + 2 * self._PAD
+
+    def sizeHint(self) -> QSize:
+        _option, box, tall, gap = self._indicator()
+        text = self._text_size(100000)
+        return QSize(box + gap + text.width() + 2, max(tall, text.height()) + 2 * self._PAD)
+
+    def minimumSizeHint(self) -> QSize:
+        _option, box, tall, gap = self._indicator()
+        metrics = self.fontMetrics()
+        words = max((metrics.horizontalAdvance(word) for word in self.text().split()), default=0)
+        return QSize(box + gap + max(words, min(self._text_size(100000).width(), 160)) + 2,
+                     max(tall, metrics.height()) + 2 * self._PAD)
+
+    def hitButton(self, pos: QPoint) -> bool:
+        return self.rect().contains(pos)
+
+    def paintEvent(self, _event) -> None:
+        option, box, tall, gap = self._indicator()
+        painter = QStylePainter(self)
+        line = self.fontMetrics().height()
+        mark = QStyleOptionButton(option)
+        mark.rect = QStyle.visualRect(option.direction, self.rect(),
+                                      QRect(0, self._PAD + max(0, (line - tall) // 2), box, tall))
+        painter.drawPrimitive(QStyle.PrimitiveElement.PE_IndicatorCheckBox, mark)
+        words = QStyle.visualRect(option.direction, self.rect(),
+                                  QRect(box + gap, self._PAD, self.width() - box - gap,
+                                        self.height() - 2 * self._PAD))
+        self.style().drawItemText(painter, words, self._FLAGS, option.palette, self.isEnabled(),
+                                  self.text(), QPalette.ColorRole.WindowText)
+        if option.state & QStyle.StateFlag.State_HasFocus and option.state & QStyle.StateFlag.State_KeyboardFocusChange:
+            ring = QStyleOptionFocusRect()
+            ring.initFrom(self)
+            ring.rect = self.rect()
+            painter.drawPrimitive(QStyle.PrimitiveElement.PE_FrameFocusRect, ring)
 
 
 class Card(QFrame):
