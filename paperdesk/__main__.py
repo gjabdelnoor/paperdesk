@@ -35,6 +35,7 @@ def main(argv=None) -> int:
     if args.smoke_test:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtCore import QTimer
+    from PySide6.QtGui import QFontInfo, QFontMetrics, QGuiApplication
     from PySide6.QtWidgets import QApplication
     from .ui import create_window
 
@@ -65,8 +66,18 @@ def main(argv=None) -> int:
                     raise RuntimeError("The simulated tablet is disconnected")
                 if getattr(window, "status", {}).get("simulated") is not True:
                     raise RuntimeError("The simulator did not report an isolated connection")
-                print(json.dumps({"ok": True, "platform": sys.platform,
-                                  "gui": "Qt Widgets", "simulated": True}))
+                latin = all(QFontMetrics(app.font()).inFontUcs4(ord(char))
+                            for char in "PaperDesk0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+                if not latin:
+                    raise RuntimeError("The GUI font cannot render its basic Latin text. Initialize the test platform's installed fonts.")
+                diagnostic = {"ok": True, "platform": sys.platform,
+                              "gui": "Qt Widgets", "simulated": True,
+                              "qpa": QGuiApplication.platformName(),
+                              "font_family": QFontInfo(app.font()).family(), "latin_glyphs": latin}
+                if args.screenshot:
+                    args.screenshot.with_suffix(".json").write_text(json.dumps(diagnostic, indent=2) + "\n")
+                if sys.stdout is not None:
+                    print(json.dumps(diagnostic))
             except Exception as exc:
                 failures.append(str(exc))
                 diagnostic = {"ok": False, "error": str(exc),

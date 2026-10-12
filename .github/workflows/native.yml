@@ -49,6 +49,8 @@ jobs:
       - name: Tests
         run: python -m pytest --junitxml=evidence/tests-${{ matrix.label }}.xml
       - name: Source GUI smoke
+        env:
+          QT_QPA_PLATFORM: ${{ runner.os == 'Windows' && 'windows' || 'offscreen' }}
         run: python -m paperdesk --smoke-test --screenshot evidence/source-${{ matrix.label }}.png
       - name: Verify native Windows pen reception
         if: runner.os == 'Windows'
@@ -56,6 +58,8 @@ jobs:
       - name: Build native application
         run: python packaging/build.py --label '${{ matrix.label }}'
       - name: Packaged GUI smoke
+        env:
+          QT_QPA_PLATFORM: ${{ runner.os == 'Windows' && 'windows' || 'offscreen' }}
         run: |
           if [[ '${{ runner.os }}' == 'Windows' ]]; then
             dist/PaperDesk/PaperDesk.exe --smoke-test --screenshot evidence/bundle-${{ matrix.label }}.png
@@ -91,6 +95,8 @@ jobs:
       - name: Test Windows installer
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          QT_QPA_PLATFORM: windows
         run: |
           $target = Join-Path $env:RUNNER_TEMP 'PaperDesk-installed-test'
           $installer = Start-Process dist/PaperDesk-windows-x86_64-setup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$target" -Wait -PassThru

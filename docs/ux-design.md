@@ -73,7 +73,8 @@ Anyone without a tablet at hand presses **Try the simulator** and can walk the s
   wrap; every page scrolls vertically and none sideways. Designed at 900 × 650 and upward, with
   room left for the larger fonts and controls of other desktops. Sections are stacked, and a
   stack is as wide as its widest pane even when that pane is out of sight, so no pane may hold
-  a row that cannot shrink.
+  a row that cannot shrink. The same holds for a caption beside a status, as in Home's
+  capability list: both wrap, the longer one first.
 
 ## Decisions
 

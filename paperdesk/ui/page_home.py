@@ -1,11 +1,14 @@
 """Home: what is connected, what it can do, and the next sensible step."""
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QVBoxLayout, QWidget
 
 from . import theme
 from .services import FEATURES
 from .widgets import Card, Page, StateDot, button, flow, label, set_role
+
+STATE_ONE_LINE = 230  # pixels a capability's status may claim before it has to wrap
 
 
 class HomePage(Page):
@@ -56,11 +59,15 @@ class HomePage(Page):
             line = QHBoxLayout()
             line.setSpacing(9)
             dot = StateDot()
-            state = label("", "muted", wrap=False)
+            # Both captions wrap, so the row is never wider than its longest word: the
+            # card's width must not depend on how wide this desktop's font happens to be.
+            name = label(text)
+            name.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            state = label("", "muted")
             state.setAccessibleName(f"{text} availability")
-            line.addWidget(dot)
-            line.addWidget(label(text, None, wrap=False))
-            line.addStretch(1)
+            state.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+            line.addWidget(dot, 0, Qt.AlignmentFlag.AlignTop)
+            line.addWidget(name, 1)
             line.addWidget(state)
             self.caps_card.body.addLayout(line)
             self.cap_rows[key] = (dot, state)
@@ -151,3 +158,7 @@ class HomePage(Page):
                 dot.set_state(theme.WARN, False)
                 state.setText("Not available yet" if key in win.capabilities else "Not reported")
                 set_role(state, "warn")
+            # The status stays on one line while that is reasonably narrow, so the longer
+            # name gives way first; past the bound it wraps too and the row still shrinks.
+            state.setMinimumWidth(min(state.fontMetrics().horizontalAdvance(state.text()) + 2,
+                                      STATE_ONE_LINE))

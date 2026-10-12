@@ -4,6 +4,48 @@ Runtime model identifier: `claude-opus-5-5` (Claude Opus 5.5, Claude Code CLI). 
 Covers the interface as it stands after `contracts/CLAUDE_INTEGRATION.md` and the layout repair
 in `contracts/CLAUDE_WINDOWS_LAYOUT.md`.
 
+## Home reflow under larger fonts (Claude, `contracts/CLAUDE_HOME_LAYOUT.md`)
+
+**Failure.** Native Windows CI at `d54f652`: the three font-stress cases failed on Home only
+(content 782 of 690 pixels at 1.2×, 876 at 1.35×). The baseline 900 × 650 test passed.
+
+**Cause.** One row. Each line of "What this tablet can do" was a dot, a one-line name, a
+stretch and a one-line status, so the card could never be narrower than its longest name plus
+its longest status: "Documents, upload, download and PDF export" beside "Connect to find out".
+With Linux fonts that card needs 439 pixels (495 with page margins), which is why Linux passed.
+The Windows runner's fallback font draws wider glyphs. Widening every glyph by half on Linux
+puts the same row at 771 pixels at 1.2× and 863 at 1.35×, close to the CI figures. No other
+Home card was near the limit.
+
+**Fix (`page_home.py` only).** Both captions in a capability row now wrap. The name takes the
+spare width and wraps first; the status keeps to one line up to 230 pixels and wraps beyond
+that. No wording changed, nothing is truncated, and the scroll bar policy and minimum window
+size are untouched. At ordinary metrics the page looks as it did.
+
+**Home at 900 pixels after the fix** (content minimum of 688–690 available; Linux, offscreen):
+
+| Style, font scale, glyph width | Connected (simulator) | Disconnected (live) | Old row alone |
+|---|---|---|---|
+| default, 1.0×, normal | 291 | 302 | 495 |
+| default, 1.2×, 150 % | 414 | 435 | 771 |
+| Fusion, 1.35×, 150 % | 455 | 479 | — |
+| Windows, 1.35×, 150 % | 455 | 479 | 863 |
+| Fusion, 1.6×, 150 % | 503 | 516 | 1003 |
+
+Card minima at Windows 1.35× with 150 % glyphs: Tablet 355, What this tablet can do 399 to 423,
+Where to next 292 (add 56 for page margins). The widest single item left on Home is the
+"Redraw tablet screen" button.
+
+**Checks run.** Full suite on Linux, screenshots enabled: 312 passed, including the three
+unchanged stress cases and the unchanged 900 × 650 test. `tests/test_ui.py` was not edited.
+The widened-glyph figures come from a scratch measuring script, not from a test in the
+repository. Home was reviewed by eye at 900 × 650 at ordinary metrics (connected) and at
+1.35× with widened glyphs (disconnected), and at 1.0× with widened glyphs (connected).
+
+**Limits.** Nothing here ran on Windows; native CI is root's acceptance gate. Widened letter
+spacing imitates a wide fallback font and is not that font. With very wide glyphs the dot sits
+a pixel or two above the first line of a wrapped name.
+
 ## Windows 900 × 650 layout repair (Claude)
 
 **Failure.** On native Windows CI,

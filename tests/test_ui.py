@@ -17,7 +17,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QSettings, Qt  # noqa: E402
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage  # noqa: E402
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontInfo, QFontMetrics, QGuiApplication, QImage  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QScrollArea, QStyleFactory,  # noqa: E402
                                QWidget)
@@ -342,6 +342,31 @@ def app(tmp_path_factory):
     QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(root))
     QSettings.setPath(QSettings.Format.NativeFormat, QSettings.Scope.UserScope, str(root))
     instance = QApplication.instance() or QApplication(["paperdesk-tests"])
+    if sys.platform == "win32" and instance.platformName() == "offscreen":
+        # Qt's Windows offscreen plugin uses FreeType and does not discover the
+        # installed Windows font database. Box glyphs give false layout metrics.
+        # Register an existing OS font in this test process only; never ship or
+        # download Microsoft's fonts, and retain every layout stress assertion.
+        system_font = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts/segoeui.ttf"
+        assert system_font.is_file(), "Windows offscreen tests require installed Segoe UI"
+        font_id = QFontDatabase.addApplicationFont(str(system_font))
+        families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
+        assert families, "Qt could not load the installed Windows Segoe UI font"
+        font = QFont(instance.font())
+        font.setFamily(families[0])  # Preserve the default point size and weight.
+        instance.setFont(font)
+        metrics = QFontMetrics(font)
+        latin = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        assert all(metrics.inFontUcs4(ord(character)) for character in latin), "Windows offscreen font still renders Latin as box glyphs"
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            import json
+            proof = {"qt_platform": instance.platformName(), "installed_font": system_font.name,
+                     "requested_family": font.family(), "actual_family": QFontInfo(font).family(),
+                     "point_size": font.pointSizeF(), "latin_glyphs": True,
+                     "font_bundled_or_downloaded": False}
+            evidence = Path("evidence/windows-offscreen-font.json")
+            evidence.parent.mkdir(parents=True, exist_ok=True)
+            evidence.write_text(json.dumps(proof, indent=2) + "\n", encoding="utf-8")
     yield instance
 
 
