@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=rm_viewport
+X-Python-2-Compatible=false
+X-Krita-Manual=Manual.html
+Name=reMarkable Viewport
+Comment=Serves the canvas view to the Paper Pro drawing-tablet bridge

@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "sha256": {
+    "tablet/bin/injector-aarch64": "6b42fd0e3909694811a2713738c6541f7410b7dd8e228ec38927f34a7605951d",
+    "tablet/bin/injector-armv7l": "1c1ad5da2795d5eb00825a9dcd8410f1a6e7b878839c5e0e1bd3eea7aa5a6ffd",
+    "tablet/bin/touch-injector-aarch64": "14bb3725712c39d38e8899176bdd9d52540b855fc229ad79e2e43645ff9f4bad",
+    "tablet/direct-paste/direct_paste.so": "e46cb160fff7e8cc2bec19621c31859d3c87ea7d39214ae505c05b8293e31357",
+    "tablet/direct-paste/xovi.so": "064323582030dff61b55d673c71f2b4d0c45e1d3a4ace595dff9559b7a8f64b8",
+    "art/pen-bridge": "baa1d52c28e8741f09a8ac8cfb839cd9370ffd77d6f58d3561e0de60ad305164",
+    "art/viewport/prebuilt/krita_viewport.so": "1cddb97bb7da723eff36c8a991a546939e7844bd5071c63e922520941cd0e854"
+  }
+}

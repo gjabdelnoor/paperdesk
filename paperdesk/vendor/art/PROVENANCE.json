@@ -1,0 +1,45 @@
+{
+  "component": "PaperDesk art bridge",
+  "source_project": "remarkable-linux-desktop/stylus",
+  "source_snapshot_date": "2026-10-12",
+  "license": "AGPL-3.0-or-later",
+  "modified_date": "2026-10-12",
+  "source_sha256": {
+    "remarkable_stylus.py": "f05a99c558cfa99044501e1f9415938cb3a63dbcb616dce4a813951a7d30dab4",
+    "pen-bridge.c": "5bb6059a72c4b380cae6f9bbdb980c6f86d270cd0cdbd66fc828886a99fa342f",
+    "viewport/extension.cpp": "908191796b65d6e79773512d8c45b6136e17779c03981f84280a00d9af04bcd6",
+    "krita/rm_viewport.desktop": "8916507834915c9ed0f418361df413fc7eccbb3589252d383a864eabe1ffcbd8",
+    "krita/rm_viewport/__init__.py": "119e62cbf77684ab472f66292b4815b434ba1cd00de2dcd8f194350aa92989ed",
+    "krita/rm_viewport/viewport.py": "d8298cadbae4aeb31cbbdac881f9802b7c9bb5e6d76bb85c1c2e7a073245fb2b",
+    "krita/rm_viewport/references.py": "f1258528038f9d3609eef9bf5a79db5cdcbd8b1140810ed3bf46a5749ef32fc2",
+    "krita/rm_viewport/placement.py": "caaa90867f04e840c95b64fb6c1d90f89d3335c99e2656a809b870d74c753678"
+  },
+  "adaptations": [
+    "Pure transforms retained; automatic application launch, deployment, font-cache repair and external SSH subprocesses removed.",
+    "Authenticated transport streams with explicit lifecycle and input release.",
+    "Runtime tablet files isolated in /tmp/paperdesk-viewport.",
+    "Portable Krita plugin socket paths, bounded requests and frames; dev execution hook removed.",
+    "Strip binaries and prefix-map SDK/source build paths."
+  ],
+  "artifacts": {
+    "pen-bridge": {
+      "sha256": "baa1d52c28e8741f09a8ac8cfb839cd9370ffd77d6f58d3561e0de60ad305164",
+      "architecture": "aarch64",
+      "linkage": "static",
+      "source": "pen-bridge.c"
+    },
+    "viewport/prebuilt/krita_viewport.so": {
+      "sha256": "1cddb97bb7da723eff36c8a991a546939e7844bd5071c63e922520941cd0e854",
+      "architecture": "aarch64",
+      "linkage": "dynamic to external tablet Qt6/system libraries",
+      "source": "viewport/extension.cpp"
+    }
+  },
+  "build_script": "build-tablet.sh",
+  "build_sdk": "Externally installed reMarkable SDK 3.26; SDK/system libraries are not redistributed",
+  "compatibility": {
+    "firmware": "3.28.0.172",
+    "xochitl_sha256": "b1816408cf90b19e448c70082625c4d6a36060368706eb7a9b35425428a9a021"
+  },
+  "validation": "Protocol/unit tests only for PaperDesk adaptation; no physical tablet was contacted during this implementation."
+}

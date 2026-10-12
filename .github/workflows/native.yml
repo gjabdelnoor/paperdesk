@@ -1,0 +1,117 @@
+name: Native builds and simulator checks
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux-x86_64
+          - os: windows-latest
+            label: windows-x86_64
+          - os: macos-14
+            label: macos-arm64
+          - os: macos-15-intel
+            label: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install native prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 libxcb-cursor0
+      - name: Install application and build dependencies
+        run: |
+          python -m pip install -r requirements-lock.txt
+          python -m pip install --no-deps -e .
+      - name: Tests
+        run: python -m pytest --junitxml=evidence/tests-${{ matrix.label }}.xml
+      - name: Source GUI smoke
+        run: python -m paperdesk --smoke-test --screenshot evidence/source-${{ matrix.label }}.png
+      - name: Verify native Windows pen reception
+        if: runner.os == 'Windows'
+        run: python tools/windows_ink_check.py --run-isolated-ci --report evidence/windows-ink.json
+      - name: Build native application
+        run: python packaging/build.py --label '${{ matrix.label }}'
+      - name: Packaged GUI smoke
+        run: |
+          if [[ '${{ runner.os }}' == 'Windows' ]]; then
+            dist/PaperDesk/PaperDesk.exe --smoke-test --screenshot evidence/bundle-${{ matrix.label }}.png
+            dist/PaperDesk/PaperDesk.exe --self-test --report evidence/selftest-${{ matrix.label }}.json
+          elif [[ '${{ runner.os }}' == 'macOS' ]]; then
+            dist/PaperDesk.app/Contents/MacOS/PaperDesk --smoke-test --screenshot evidence/bundle-${{ matrix.label }}.png
+            dist/PaperDesk.app/Contents/MacOS/PaperDesk --self-test --report evidence/selftest-${{ matrix.label }}.json
+          else
+            dist/PaperDesk/PaperDesk --smoke-test --screenshot evidence/bundle-${{ matrix.label }}.png
+            dist/PaperDesk/PaperDesk --self-test --report evidence/selftest-${{ matrix.label }}.json
+          fi
+      - name: Upload application
+        uses: actions/upload-artifact@v4
+        with:
+          name: PaperDesk-${{ matrix.label }}
+          path: dist/PaperDesk-${{ matrix.label }}.zip
+          if-no-files-found: error
+      - name: Create macOS disk image
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist/dmg-root
+          cp -R dist/PaperDesk.app dist/dmg-root/
+          ln -s /Applications dist/dmg-root/Applications
+          hdiutil create -volname PaperDesk -srcfolder dist/dmg-root -ov -format UDZO dist/PaperDesk-${{ matrix.label }}.dmg
+      - name: Create Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $compiler = Get-ChildItem 'C:\Program Files (x86)\Inno Setup*\ISCC.exe' | Select-Object -First 1
+          if (-not $compiler) { throw 'Inno Setup compiler is unavailable' }
+          & $compiler.FullName packaging/windows.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer build failed' }
+      - name: Test Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'PaperDesk-installed-test'
+          $installer = Start-Process dist/PaperDesk-windows-x86_64-setup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$target" -Wait -PassThru
+          if ($installer.ExitCode -ne 0) { throw 'Installer test failed' }
+          $app = Start-Process "$target\PaperDesk.exe" -ArgumentList '--smoke-test', '--screenshot', "$env:GITHUB_WORKSPACE\evidence\installed-windows.png" -Wait -PassThru
+          if ($app.ExitCode -ne 0) { throw 'Installed GUI test failed' }
+          $uninstaller = Start-Process "$target\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          if ($uninstaller.ExitCode -ne 0) { throw 'Uninstall test failed' }
+      - name: Upload desktop installers
+        if: runner.os != 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.label }}
+          path: |
+            dist/*.dmg
+            dist/*-setup.exe
+          if-no-files-found: error
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-${{ matrix.label }}
+          path: evidence/
+          if-no-files-found: warn

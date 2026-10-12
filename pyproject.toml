@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paperdesk"
+version = "0.1.0"
+description = "A lightweight native desktop companion for reMarkable tools and art software"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+authors = [{name = "Gabriel Abdelnoor"}]
+dependencies = [
+  "PySide6-Essentials>=6.8,<7",
+  "paramiko>=3.5,<5",
+  "Pillow>=11,<13",
+  "platformdirs>=4,<5",
+  "portalocker>=3,<4",
+  "PyMuPDF>=1.25,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pyinstaller>=6,<7", "psutil>=6,<8"]
+art = ["evdev>=1.7; sys_platform == 'linux'"]
+
+[project.scripts]
+paperdesk = "paperdesk.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/gjabdelnoor/paperdesk"
+Issues = "https://github.com/gjabdelnoor/paperdesk/issues"
+
+[tool.setuptools.packages.find]
+include = ["paperdesk*"]
+
+[tool.setuptools.package-data]
+paperdesk = ["vendor/**/*", "resources/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

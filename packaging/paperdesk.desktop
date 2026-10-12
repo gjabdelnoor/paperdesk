@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=PaperDesk
+Comment=reMarkable tools and art in one desktop workspace
+Exec=paperdesk
+Icon=accessories-text-editor
+Terminal=false
+Type=Application
+Categories=Office;Graphics;
