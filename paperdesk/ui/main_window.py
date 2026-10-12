@@ -35,7 +35,7 @@ SHORTCUTS = [
     ("Ctrl+Shift+K", "Disconnect"),
     ("F5", "Check tablet status"),
     ("Shift+F5", "Refresh the tablet's screen"),
-    ("Ctrl+U", "Upload PDF or EPUB files"),
+    ("Ctrl+U", "Upload PDF, EPUB or RMDOC files"),
     ("Ctrl+D", "Download the selected document"),
     ("Ctrl+E", "Export the open document as PDF"),
     ("Ctrl+I", "Upload an image as a native sticker notebook"),
@@ -44,7 +44,10 @@ SHORTCUTS = [
     ("Ctrl+Shift+C", "Copy a tablet screenshot"),
     ("Ctrl+Enter", "Send the text in Type › Write"),
     ("Shift+Esc", "Stop the live keyboard"),
-    ("Ctrl+C, Ctrl+V, Ctrl+W", "In the live keyboard: copy, paste, close document on the tablet"),
+    ("Ctrl+C, Ctrl+P, Ctrl+W", "In the live keyboard: copy, paste the tablet's own clipboard, close "
+                               "document on the tablet"),
+    ("Ctrl+V, Ctrl+Shift+V", "In the live keyboard: paste this computer's clipboard text or image "
+                             "(Cmd+V on macOS)"),
     ("Ctrl+L", "Activity log"),
     ("F1", "This list"),
     ("Tab, Shift+Tab", "Move between controls; Space or Enter activates"),
@@ -195,11 +198,14 @@ class MainWindow(QMainWindow):
             port = int(self.settings.value("connection/port", default.port))
         except (TypeError, ValueError):
             port = default.port
+        # Settings written before the selector existed have no mode and stay on plain SSH.
+        mode = str(self.settings.value("connection/transport_mode", default.transport_mode) or "")
         return DeviceConfig(
             host=str(self.settings.value("connection/host", default.host) or default.host),
             port=port,
             username=str(self.settings.value("connection/username", default.username) or default.username),
-            key_path=str(self.settings.value("connection/key_path", "") or ""))
+            key_path=str(self.settings.value("connection/key_path", "") or ""),
+            transport_mode=mode if mode in ("ssh", "tailscale") else default.transport_mode)
 
     def _save_connection(self, config: DeviceConfig) -> None:
         # The password is deliberately absent: it lives in memory only.
@@ -207,6 +213,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("connection/port", int(config.port))
         self.settings.setValue("connection/username", config.username)
         self.settings.setValue("connection/key_path", config.key_path)
+        self.settings.setValue("connection/transport_mode", config.transport_mode)
         self.settings.sync()
 
     def _make(self, factory: Callable[[], Any]) -> Any:
@@ -699,7 +706,8 @@ class MainWindow(QMainWindow):
         else:
             self.navigate("setup", "connect")
             panel.focus_first_missing()
-            self.notify("info", "Enter the tablet's password or choose a key file, then connect.")
+            self.notify("info", "Enter the tablet's Tailscale address and user name, then connect."
+                        if panel.tailscale() else "Enter the tablet's password or choose a key file, then connect.")
 
     def connect_with(self, config: DeviceConfig) -> bool:
         """Start pairing with a real tablet: read its identity, then wait for trust."""

@@ -42,7 +42,6 @@ def main():
         except Exception as exc:
             errors.append(str(exc))
             window.close()
-            app.quit()
 
     def finish():
         try:
@@ -57,7 +56,6 @@ def main():
             print(json.dumps(result))
         finally:
             window.close()
-            app.quit()
 
     QTimer.singleShot(2500, capture)
     app.exec()

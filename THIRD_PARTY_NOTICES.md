@@ -16,6 +16,11 @@ tablet document is distributed.
 - platformdirs: MIT, https://github.com/tox-dev/platformdirs
 - portalocker: BSD-3-Clause, https://github.com/wolph/portalocker
 - cryptography: Apache-2.0/BSD-3-Clause, https://github.com/pyca/cryptography
+- OpenSSL 3 and later (Python/cryptography runtime libraries): Apache-2.0,
+  https://openssl-library.org/ . Dynamically collected macOS pairs include the
+  selected package's complete license, any NOTICE files, and versioned source
+  origin under `Contents/Resources/licenses/OpenSSL`; static cryptography wheels
+  retain their distribution's license files.
 - bcrypt and PyNaCl: Apache-2.0; CFFI: MIT.
 - evdev (optional Linux art mode): BSD-3-Clause, https://github.com/gvalkov/python-evdev
 - PyInstaller (build tooling): GPL-2.0 with bootloader exception,

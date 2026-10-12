@@ -203,7 +203,7 @@ class ArtManager:
         pen = native_ready or ink
         mac_permission = self.platform == "darwin" and mac_input_permission()
         canvas = native_ready or self.platform == "win32" or mac_permission
-        return {"launch": True, "file_open": True, "pointer": self.platform in ("darwin", "win32") or native_ready,
+        return {"platform": self.platform, "launch": True, "file_open": True, "pointer": self.platform in ("darwin", "win32") or native_ready,
                 "pressure": pen, "tilt": pen, "multitouch": pen or (canvas and self.platform == "darwin"),
                 "native_multitouch": pen, "canvas_gestures": canvas, "canvas_ipc": True,
                 "art_display": canvas, "mac_input_permission": mac_permission,
@@ -297,7 +297,10 @@ class ArtManager:
         if self.transport is None or not hasattr(self.transport, "stream"):
             raise ArtError("Pair and connect to the tablet before starting art mode.")
         # All device commands here are fixed read-only scripts, never interpolated config.
-        script = """printf 'firmware='; sed -n 's/^IMG_VERSION=\"\\(.*\\)\"/\\1/p' /etc/os-release
+        script = """model=$(cat /sys/devices/soc0/machine 2>/dev/null || true)
+if [ -z "$model" ]; then model=$(tr -d '\\000' </sys/firmware/devicetree/base/model 2>/dev/null || true); fi
+printf 'model=%s\\n' "$model"
+printf 'firmware='; sed -n 's/^IMG_VERSION=\"\\(.*\\)\"/\\1/p' /etc/os-release
 printf 'arch='; uname -m
 printf 'xochitl='; sha256sum /usr/bin/xochitl 2>/dev/null | cut -d' ' -f1
 printf 'helper='; sha256sum /home/root/.local/lib/paperdesk/current/bin/pen-bridge 2>/dev/null | cut -d' ' -f1
@@ -311,7 +314,9 @@ printf 'touch_node='; test -r /dev/input/event3 && echo yes || echo no
         except Exception as error:
             raise ArtError("Could not verify art support on the tablet. Reconnect and run setup diagnostics.") from error
         observed = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
-        if observed.get("firmware") != SUPPORTED_FIRMWARE or observed.get("arch") != "aarch64" or observed.get("xochitl") != XOCHITL_SHA256:
+        from .installer import classify_model
+        if (classify_model(observed.get("model", ""), observed.get("arch", "")) != "paper-pro"
+                or observed.get("firmware") != SUPPORTED_FIRMWARE or observed.get("xochitl") != XOCHITL_SHA256):
             raise ArtError("Art input is validated only for Paper Pro firmware 3.28.0.172 with the pinned xochitl build. This device is unsupported; no input stream was opened.")
         if observed.get("helper") != _digest(self.assets / "pen-bridge") or observed.get("pen_node") != "yes":
             raise ArtError("Install the art-display feature in the setup wizard before starting art input. The verified PaperDesk pen helper is required.")

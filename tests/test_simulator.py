@@ -12,7 +12,8 @@ def test_fresh_models_and_persistent_documents(tmp_path):
     assert pro._state["architecture"]=="aarch64"
     assert rm2._state["architecture"]=="armv7l"
     assert not pro.status()["capabilities"]["keyboard"]
-    assert len(pro.documents())==2
+    assert len([doc for doc in pro.documents() if doc["type"] != "folder"])==2
+    assert {doc["name"] for doc in pro.documents() if doc["type"] == "folder"} == {"Inbox", "Archive", "Sketches"}
     assert TabletSimulator(tmp_path/"pro").documents()==pro.documents()
 
 
@@ -35,7 +36,7 @@ def test_paths_cannot_escape_or_follow_symlinks(tmp_path):
 def test_upload_unknown_is_not_retried(tmp_path):
     sim=TabletSimulator(tmp_path/"sim");pdf=tmp_path/"reading.pdf";pdf.write_bytes(_pdf("synthetic upload"));sim.set_fault("upload-unknown")
     with pytest.raises(UnknownMutationError,match="do not retry"):sim.upload(pdf)
-    assert len(sim.documents())==3
+    assert len([doc for doc in sim.documents() if doc["type"] != "folder"])==3
     assert sum(event["action"]=="native-import" for event in sim.operations)==1
 
 
@@ -46,6 +47,20 @@ def test_native_import_export_preserves_existing_file(tmp_path):
     with pytest.raises(SimulationError,match="already exists"):sim.download(result["id"],output)
     assert output.read_bytes()==data
     with pytest.raises(SimulationError):sim.download("../../outside",output)
+
+
+def test_simulated_empty_folder_uuid_and_top_level_match_native_destinations(tmp_path):
+    sim = TabletSimulator(tmp_path / "sim")
+    source = tmp_path / "source.pdf"
+    source.write_bytes(_pdf("Synthetic empty-folder upload"))
+    folder = next(doc for doc in sim.documents() if doc["name"] == "Sketches")
+    assert not any(doc["folder"] == "Sketches" for doc in sim.documents())
+    result = sim.upload(source, folder["id"])
+    assert next(doc for doc in sim.documents() if doc["id"] == result["id"])["folder"] == "Sketches"
+    result = sim.upload(source)
+    assert next(doc for doc in sim.documents() if doc["id"] == result["id"])["folder"] == ""
+    with pytest.raises(SimulationError, match="missing or ambiguous"):
+        sim.upload(source, "missing folder")
 
 
 def test_keyboard_page_image_screenshot_and_reboot(tmp_path):

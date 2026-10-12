@@ -89,6 +89,12 @@ class TabletSimulator:
                 self._path(f"/.simulator/documents/{ident}.pdf").write_bytes(_pdf(text))
             self._state["active_id"] = self._state["documents"][0]["id"]
             self._save()
+        if "folders" not in self._state:
+            self._state["folders"] = [
+                {"id": str(uuid.uuid4()), "name": name, "type": "folder", "pages": 0,
+                 "modified": time.time(), "folder": ""}
+                for name in ("Inbox", "Archive", "Sketches")]
+            self._save()
 
     def _path(self, remote: str) -> Path:
         if not isinstance(remote, str) or "\x00" in remote: raise SimulationError("Invalid simulated tablet path.")
@@ -248,7 +254,9 @@ class TabletSimulator:
         return {"connected": True, "simulated": True, "model": self._state["model"], "firmware": self._state["firmware"], "host": "simulation", "transport": "isolated files", "capabilities": caps, "active_document": active, "message": "Simulation — no physical tablet is connected."}
 
     def documents(self):
-        self._online(); return [{key: doc[key] for key in ("id", "name", "type", "pages", "modified", "folder")} for doc in self._state["documents"]]
+        self._online()
+        return [{key: doc[key] for key in ("id", "name", "type", "pages", "modified", "folder")}
+                for doc in self._state["documents"]] + [dict(folder) for folder in self._state["folders"]]
 
     def _active(self, optional=False):
         doc = next((item for item in self._state["documents"] if item["id"] == self._state["active_id"]), None)
@@ -262,6 +270,11 @@ class TabletSimulator:
 
     def upload(self, path, folder=""):
         self._online(); source = Path(path)
+        if folder:
+            matches = [item for item in self._state["folders"] if folder in (item["id"], item["name"])]
+            if len(matches) != 1:
+                raise SimulationError("The destination folder is missing or ambiguous. Choose an existing folder.")
+            folder = matches[0]["name"]
         if source.suffix.lower() not in {".pdf", ".epub", ".rmdoc"}: raise SimulationError("Native imports accept PDF, EPUB and RMDOC files.")
         if not source.is_file() or source.is_symlink(): raise SimulationError("Select an existing regular document file.")
         data = source.read_bytes()
@@ -285,7 +298,7 @@ class TabletSimulator:
             except (ValueError, KeyError, zipfile.BadZipFile) as exc:
                 raise SimulationError("The selected RMDOC is not a supported native document archive.") from exc
         self._path(f"/.simulator/documents/{ident}.{kind}").write_bytes(data)
-        self._state["documents"].append({"id": ident, "name": str(title), "type": "notebook" if kind == "rmdoc" else kind, "pages": 1, "modified": time.time(), "folder": folder or "Inbox", "text": "Imported simulated document", "images": [{"simulated": True} for _ in range(image_count)], "templates": ["blank"]})
+        self._state["documents"].append({"id": ident, "name": str(title), "type": "notebook" if kind == "rmdoc" else kind, "pages": 1, "modified": time.time(), "folder": folder, "text": "Imported simulated document", "images": [{"simulated": True} for _ in range(image_count)], "templates": ["blank"]})
         self._save(); self._record("native-import", id=ident, bytes=len(data))
         if "upload-unknown" in self.faults: raise UnknownMutationError("Import may have completed, but its receipt was lost. Inspect Documents; do not retry the upload automatically.")
         return {"ok": True, "message": "Imported into the simulation.", "id": ident, "state": "verified"}

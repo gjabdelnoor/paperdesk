@@ -349,12 +349,22 @@ def test_tablet_probe_fails_closed_without_starting_stream(tmp_path):
 def test_missing_helper_requires_wizard_without_implicit_deploy(tmp_path):
     m = manager(tmp_path, platform="darwin")
     transport = Mock()
-    transport.run.return_value = f"firmware={SUPPORTED_FIRMWARE}\narch=aarch64\nxochitl={XOCHITL_SHA256}\nhelper=\npen_node=yes\n"
+    transport.run.return_value = f"model=reMarkable Paper Pro\nfirmware={SUPPORTED_FIRMWARE}\narch=aarch64\nxochitl={XOCHITL_SHA256}\nhelper=\npen_node=yes\n"
     m.transport = transport
     with pytest.raises(ArtError, match="setup wizard"):
         m.start()
     transport.write_bytes.assert_not_called()
     transport.stream.assert_not_called()
+
+
+@pytest.mark.parametrize("model", ["", "reMarkable Paper Pro Move", "Unknown tablet"])
+def test_art_refuses_other_models_even_with_matching_firmware_and_binary(tmp_path, model):
+    m = manager(tmp_path, platform="darwin")
+    m.transport = Mock()
+    m.transport.run.return_value = f"model={model}\nfirmware={SUPPORTED_FIRMWARE}\narch=aarch64\nxochitl={XOCHITL_SHA256}\n"
+    with pytest.raises(ArtError, match="unsupported"):
+        m.start()
+    m.transport.stream.assert_not_called()
 
 
 def test_canvas_protocol_is_app_owned_and_has_no_installer():

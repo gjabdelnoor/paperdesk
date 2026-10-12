@@ -134,8 +134,8 @@ class InkPanel(QWidget):
                    "Three steps, in order. Open the right page on the tablet, choose its pen tool, and "
                    "keep the placement area empty.")
         self.probe_button = button("1  Check the tablet's pen…", None,
-                                   "Copies PaperDesk's pen helper into its own folder on the tablet and "
-                                   "reads the pen's range. Draws nothing.")
+                                   "Verifies the pen helper that Setup installed and reads the pen's "
+                                   "range. Copies nothing and draws nothing.")
         self.probe_button.clicked.connect(self.probe)
         self.probe_note = label("", "muted")
         self.probe_note.setAccessibleName("Pen check result")
@@ -144,9 +144,13 @@ class InkPanel(QWidget):
         self.mark_button.clicked.connect(self.draw_mark)
         self.mark_note = label("", "muted")
         self.mark_note.setAccessibleName("Calibration mark result")
-        self.confirm = QCheckBox("I looked at the tablet: the corner mark sits at the top-left of the "
-                                 "area where I want the figure, on the right page")
+        self.confirm = QCheckBox("I looked at the tablet and the corner mark is in the right place")
         self.confirm.setAccessibleName("Calibration mark inspected on the tablet")
+        self.confirm.setAccessibleDescription("The mark sits at the top-left of the area where the figure "
+                                              "should go, on the right page")
+        confirm_help = label("It should sit at the top-left of the area where you want the figure, on "
+                             "the right page.", "caption")
+        confirm_help.setContentsMargins(24, 0, 0, 0)
         self.confirm.toggled.connect(self.refresh_state)
         self.draw_button = button("3  Draw figure as ink…", "primary")
         self.draw_button.clicked.connect(self.draw)
@@ -160,7 +164,7 @@ class InkPanel(QWidget):
         self.outcome = label("", "muted")
         self.outcome.setAccessibleName("Ink outcome")
         for widget in (flow(self.probe_button), self.probe_note, flow(self.mark_button), self.mark_note,
-                       self.confirm, flow(self.draw_button, self.cancel_button), self.progress,
+                       self.confirm, confirm_help, flow(self.draw_button, self.cancel_button), self.progress,
                        self.outcome):
             ink.add(widget)
         self.notice = ink.add(label("", "warn"))
@@ -238,6 +242,9 @@ class InkPanel(QWidget):
         elif not can_probe or stream is None:
             reason = ("This build's device backend offers no figure-as-ink calls, so only the preview is "
                       "available.")
+        elif win.capabilities.get("experimental-ink") is False:
+            reason = ("This tablet does not report experimental ink, which needs the exact verified "
+                      "Paper Pro firmware. The preview still works.")
         else:
             reason = ""
         self.notice.setText(reason)
@@ -252,7 +259,8 @@ class InkPanel(QWidget):
         self.cancel_button.setEnabled(self.drawing and stream is not None and accepts(stream, "cancelled")
                                       and not self._cancel.is_set())
         if win.connected and not reason and not self.probe_note.text():
-            self.probe_note.setText(("Simulation: the pen check is simulated. " if win.simulated else "")
+            self.probe_note.setText(("Simulation: the pen range is synthetic; position and ink on a real "
+                                     "page are not tested. " if win.simulated else "")
                                     + "The pen has not been checked in this session.")
             set_role(self.probe_note, "muted")
 
@@ -261,9 +269,11 @@ class InkPanel(QWidget):
         if not isinstance(stats, dict):
             return "Preview ready."
         seconds = stats.get("minimum_seconds")
-        timing = f", at least {seconds:.0f} s to draw" if isinstance(seconds, (int, float)) else ""
-        return (f"Preview ready: {stats.get('strokes', '?')} strokes, {stats.get('points', '?')} points"
-                f"{timing}. The red outline is the placement area."
+        timing = (f", at least {max(1, round(seconds))} s to draw"
+                  if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) else "")
+        strokes, points = stats.get("strokes", "?"), stats.get("points", "?")
+        return (f"Preview ready: {strokes} stroke{'' if strokes == 1 else 's'}, {points} "
+                f"point{'' if points == 1 else 's'}{timing}. The red outline is the placement area."
                 + ("" if self.axis_ratio is not None else
                    " It uses a typical pen shape until the tablet's pen has been checked."))
 
@@ -315,9 +325,10 @@ class InkPanel(QWidget):
         where = "the simulated tablet" if self.win.simulated else "the tablet"
         if not self.win.dialogs.confirm(
                 "Check the tablet's pen?",
-                f"PaperDesk copies its small pen helper into its own folder on {where} and reads the "
-                "range of the physical pen. Nothing is drawn. It refuses on any tablet or firmware "
-                "that has not been verified for experimental ink.", "Check pen"):
+                f"PaperDesk verifies the pen helper that Setup › Features installed with the keyboard "
+                f"extra on {where}, and reads the range of the pen. Nothing is copied and nothing is "
+                "drawn. It refuses on any tablet or firmware that is not the exact verified Paper Pro "
+                "build, or when the helper is missing or altered.", "Check pen"):
             return
         self.win.run("ink-probe", lambda s: method(s, *INK_PROBE)(), mutation=True,
                      label="Check the tablet's pen for experimental ink",

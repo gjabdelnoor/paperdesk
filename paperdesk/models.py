@@ -11,3 +11,4 @@ class DeviceConfig:
     key_path: str = ""
     password: str = field(default="", repr=False)
     state_dir: Path | None = None
+    transport_mode: str = "ssh"

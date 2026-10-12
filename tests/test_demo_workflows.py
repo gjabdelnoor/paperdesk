@@ -43,6 +43,8 @@ def test_full_demo_tool_sequence_and_original_preservation(offline_demo, tmp_pat
     assert service.upload(str(export))["ok"]
     assert service.create_sticker(str(image))["ok"]
     for index, document in enumerate(service.documents()):
+        if document["type"] == "folder":
+            continue
         result = service.download(document["id"], str(tmp_path / f"download-{index}.pdf"))
         assert result["ok"]
     assert service.refresh()["ok"]

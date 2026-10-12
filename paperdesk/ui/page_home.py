@@ -100,7 +100,8 @@ class HomePage(Page):
         elif mode == "simulation":
             title = f"Simulation — {win.device_name()}" if connected else "Simulation — not started"
             intro = ("You are looking at a pretend tablet that lives in a temporary folder on this "
-                     "computer. Everything works as it would on a tablet, and nothing leaves this machine.")
+                     "computer. It rehearses connecting, setup and document handling; it does not run "
+                     "the tablet's own software or its screen. Nothing leaves this machine.")
         elif connected:
             title, intro = f"{win.device_name()} connected", "Ready. PaperDesk only acts when you ask it to."
         elif win.connection_lost:

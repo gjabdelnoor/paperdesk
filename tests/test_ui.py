@@ -17,10 +17,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtGui import QColor, QGuiApplication, QImage  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMainWindow  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QScrollArea  # noqa: E402
 
 from paperdesk.models import DeviceConfig  # noqa: E402
 from paperdesk.ui import MainWindow, create_window  # noqa: E402
+from paperdesk.ui.main_window import SHORTCUTS  # noqa: E402
+from paperdesk.ui.page_library import UPLOAD_FILTER  # noqa: E402
 from paperdesk.ui.services import ServiceProvider  # noqa: E402
 
 FINGERPRINT = "SHA256:Zk3vQ0m1r8yJ4uXbT2sLw9aHnE6cPdF5gKoR7iVtUxA"
@@ -168,6 +170,15 @@ class FakeService:
     def sync(self, folder):
         self._call("sync", folder)
         return {"ok": True, "message": "Folder is up to date.", "downloaded": 0, "uploaded": 0}
+
+    def archive_sync_status(self):
+        self._call("archive_sync_status")
+        return dict(getattr(self, "archive", {"available": False, "active": False,
+                                              "message": "No existing archive-sync status was found."}))
+
+    def art_plugin_probe(self):
+        self._call("art_plugin_probe")
+        return {"ok": True, "protocol": 1, "message": "Krita viewport plugin answered."}
 
     # -- typing ---------------------------------------------------------
     def type_text(self, text):
@@ -442,6 +453,22 @@ def test_navigation_reaches_every_page_and_section(app, make):
     assert menus == ["File", "Tablet", "View", "Help"]
 
 
+def test_no_page_needs_sideways_scrolling_at_the_smallest_supported_size(app, make):
+    window, _service = demo_window(app, make)
+    for size in ((900, 650), (1180, 800)):
+        window.resize(*size)
+        window.show()
+        for page_id, page in window.pages.items():
+            sections = getattr(page, "sections", None)
+            for section in (sections.visible_ids() if sections else [None]):
+                window.navigate(page_id, section)
+                for _ in range(4):
+                    app.processEvents()
+                wide = [area for area in page.findChildren(QScrollArea)
+                        if area.isVisible() and area.horizontalScrollBar().maximum() > 0]
+                assert not wide, f"{page_id}/{section} is wider than a {size[0]} pixel window"
+
+
 def test_try_the_simulator_from_a_disconnected_window(app, make):
     live, sim = FakeService(simulated=False), FakeService(simulated=True)
     window = make(live, provider=ServiceProvider(live_service=live, demo_service=sim))
@@ -699,7 +726,7 @@ def test_art_mode_reports_state_and_is_stopped_on_exit(app, make):
     window.refresh_status()
     settle(app, window)
     art = window.pages["art"]
-    assert art.cap_labels["pressure"].text() == "Supported"
+    assert art.cap_labels["pressure"].text() == "Reported available"
     assert art.cap_labels["tilt"].text() == "Not reported yet"
     art.choose("inkscape")
     art.rotation.setCurrentIndex(2)
@@ -737,8 +764,11 @@ def test_worker_teardown_is_clean_even_with_work_in_flight(app, make):
     window.pages["setup"].run_diagnostics()
     window.reload_documents()
     assert service.entered["diagnostics"].wait(5)
-    threading.Timer(0.2, service.gates["diagnostics"].set).start()
     documents_before = service.count("documents")
+    assert window.shutdown(timeout_ms=0) is False
+    assert window.runner.running, "active work must remain owned until cleanup completes"
+    service.gates["diagnostics"].set()
+    settle(app, window)
     assert window.shutdown() is True
     assert not window.runner.running
     assert service.count("documents") == documents_before, "waiting work is dropped at shutdown"
@@ -758,7 +788,8 @@ def test_image_sticker_upload_and_setup_link_for_missing_extras(app, make, tmp_p
     assert typing.sticker_button.isEnabled(), "stickers need no installed extras"
     typing.sticker_button.click()
     settle(app, window)
-    assert [c for c in service.calls if c[0] == "create_sticker"] == [("create_sticker", str(picture), "")]
+    folder = str(window.pages["library"].folder_combo.currentData() or "")
+    assert [c for c in service.calls if c[0] == "create_sticker"] == [("create_sticker", str(picture), folder)]
     assert "Sticker notebook uploaded." in window.status_text
     assert window.pages["library"].table.topLevelItemCount() == 4
 
@@ -931,7 +962,6 @@ def test_art_applications_options_and_krita_plugin_steps(app, make, tmp_path):
 
     service.art_caps = {"pressure": False, "tilt": False, "multitouch": False, "art_display": False,
                         "pointer_only": True, "windows_ink": True}
-    window.art_state = {"active": False, "application": ""}
     art.discover()
     settle(app, window)
     window.show()
@@ -940,6 +970,120 @@ def test_art_applications_options_and_krita_plugin_steps(app, make, tmp_path):
     assert not art.pressure.isEnabled() and not art.touch_check.isEnabled()
     assert "plain pointer" in art.limits_label.text() and art.ink_note.isVisibleTo(art)
     assert art.options()["touch"] is False and "display" not in art.options()
+
+
+def _art_on(app, window, service, **caps):
+    service.art_caps = caps
+    art = window.pages["art"]
+    art.discover()
+    settle(app, window)
+    return art
+
+
+def _last_start(service):
+    return [c for c in service.calls if c[0] == "start_art"][-1]
+
+
+BASE = {"rotation": "auto", "pressure": 0.5, "curve": 0.8, "tilt": 0.0}
+
+
+def test_art_input_method_and_touch_follow_the_bridge_on_each_desktop(app, make):
+    window, service = demo_window(app, make)
+    service.installed.add("art-display")
+    window.refresh_status()
+    settle(app, window)
+    window.show()
+
+    # macOS: pointer by default, pen pressure only after an explicit experimental opt-in.
+    art = _art_on(app, window, service, pressure=False, tilt=False, multitouch=True,
+                  native_multitouch=False, canvas_gestures=True, art_display=True,
+                  experimental_pressure=True, pointer_only=True, mac_input_permission=True)
+    assert art.host() == "mac" and art.input_mode.itemText(1) == "Pen — experimental pressure"
+    assert art.cap_labels["pressure"].text() == "Not available here"
+    assert not art.pressure.isEnabled() and not art.mac_pen_ack.isVisibleTo(art)
+    assert not art.touch_check.isEnabled() and "canvas display" in art.touch_note.text()
+    art.start_button.click()
+    settle(app, window)
+    assert _last_start(service) == ("start_art", "krita", {**BASE, "touch": False}), \
+        "Automatic sends no input method, so the bridge keeps its own default"
+    art.stop_mode()
+    settle(app, window)
+    art.input_mode.setCurrentIndex(1)
+    assert art.mac_pen_ack.isVisibleTo(art) and not art.start_button.isEnabled()
+    assert "Experimental" in art.mode_help.text() and "not been verified" in art.mode_help.text()
+    assert art.cap_labels["pressure"].text().startswith("Experimental")
+    art.start_mode()
+    settle(app, window)
+    assert service.count("start_art") == 1, "experimental pen pressure is never started unasked"
+    art.mac_pen_ack.setChecked(True)
+    assert art.start_button.isEnabled() and art.pressure.isEnabled()
+    art.plugin_ready.setChecked(True)
+    art.display_check.setChecked(True)
+    assert art.touch_check.isEnabled() and not art.touch_check.isChecked()
+    art.touch_check.setChecked(True)
+    art.start_button.click()
+    settle(app, window)
+    assert _last_start(service) == ("start_art", "krita", {**BASE, "touch": True, "mode": "pen",
+                                                           "display": True})
+    art.stop_mode()
+    settle(app, window)
+    art.display_check.setChecked(False)
+    assert not art.touch_check.isChecked() and not art.touch_check.isEnabled(), \
+        "on macOS touch exists only through Krita's canvas display"
+    art.input_mode.setCurrentIndex(0)
+    assert not art.mac_pen_ack.isChecked(), "the opt-in does not survive leaving pen mode"
+
+    # Windows: Windows Ink by default, explicit mouse mode drops pressure and native touch.
+    art = _art_on(app, window, service, windows_ink_available=True, native_multitouch=True,
+                  canvas_gestures=True, pointer_only=False)
+    assert art.host() == "windows" and art.ink_note.isVisibleTo(art)
+    assert art.touch_check.isChecked() and "native multi-touch" in art.touch_note.text()
+    art.input_mode.setCurrentIndex(2)
+    assert not art.pressure.isEnabled() and not art.ink_note.isVisibleTo(art)
+    assert art.cap_labels["native_multitouch"].text() == "Not available here"
+    assert not art.touch_check.isChecked()
+    art.start_button.click()
+    settle(app, window)
+    assert _last_start(service) == ("start_art", "krita", {**BASE, "touch": False, "mode": "mouse"})
+    art.stop_mode()
+    settle(app, window)
+
+    # Linux: a pen tablet; mouse mode cannot be chosen, and a missing driver is explained.
+    art = _art_on(app, window, service, linux_driver_installed=True, linux_input_permission=True,
+                  native_multitouch=True, canvas_gestures=True)
+    assert art.host() == "linux" and art.input_method() == "auto", "mouse mode is dropped on Linux"
+    assert not art.input_mode.model().item(2).isEnabled()
+    art.input_mode.setCurrentIndex(2)
+    assert art.input_method() == "auto" and not art.host_note.isVisibleTo(art)
+    art.input_mode.setCurrentIndex(1)
+    assert art.touch_check.isEnabled() and not art.touch_check.isChecked(), \
+        "touch that was switched off is never switched back on unasked"
+    art.touch_check.setChecked(True)
+    art.start_button.click()
+    settle(app, window)
+    assert _last_start(service) == ("start_art", "krita", {**BASE, "touch": True, "mode": "pen"})
+    art.stop_mode()
+    settle(app, window)
+    art = _art_on(app, window, service, linux_driver_installed=False, pressure=False, art_display=False)
+    assert art.host_note.isVisibleTo(art) and "pen driver" in art.host_note.text()
+    assert "pen driver" in art.display_note.text()
+
+
+def test_copy_matches_what_the_backend_does(app, make):
+    from paperdesk.ui import page_ink, page_type
+    window, _service = demo_window(app, make)
+    note = page_type.UNICODE_NOTE
+    assert "plain US equivalents" in note and "refuses the whole text" in note
+    assert "never swaps" not in note
+    ink = window.pages["type"].ink
+    assert "Copies nothing" in ink.probe_button.toolTip()
+    ink.axis_ratio = None
+    ink.probe()
+    assert window.dialogs.confirmations[-1] == "Check the tablet's pen?"
+    window.navigate("home")
+    intro = window.pages["home"].intro_label.text()
+    assert "does not run the tablet's own software" in intro and "Everything works" not in intro
+    assert page_ink.PARTIAL_HELP.startswith("Marks already drawn stay")
 
 
 def test_sandbox_is_simulation_only_and_fresh_tablets_ignore_saved_settings(app, make):
@@ -1017,7 +1161,183 @@ def test_shortcuts_and_sync_result_are_visible(app, make, tmp_path):
     service.sync = lambda folder: (_ for _ in ()).throw(RuntimeError("The folder is read-only."))
     library.sync()
     settle(app, window)
-    assert "did not finish" in library.sync_result.text() and "read-only" in library.sync_result.text()
+    assert "copy pass did not finish" in library.sync_result.text() and "read-only" in library.sync_result.text()
+    service.sync = lambda folder: {"ok": True, "message": "Originals were preserved.", "uploaded": 1,
+                                   "downloaded": 3, "path": str(tmp_path / "device-copies" / "20261012-090000"),
+                                   "mode": "copy-only"}
+    window.dismiss_uncertain()
+    library.sync()
+    settle(app, window)
+    text = library.sync_result.text()
+    assert text.startswith("Last copy pass:") and "uploaded: 1, downloaded: 3." in text
+    assert "Tablet copies are in" in text and "20261012-090000" in text and "copy-only" not in text
+
+
+def test_upload_folders_are_the_tablets_real_folder_rows(app, make, tmp_path):
+    window, service = demo_window(app, make)
+    library = window.pages["library"]
+    inbox, archive = "11111111-aaaa-4aaa-8aaa-000000000001", "22222222-aaaa-4aaa-8aaa-000000000002"
+    work_a, work_b = "33333333-aaaa-4aaa-8aaa-000000000003", "44444444-aaaa-4aaa-8aaa-000000000004"
+    folders = [{"id": ident, "name": name, "type": "folder", "pages": 0, "modified": 0, "folder": ""}
+               for ident, name in ((inbox, "Inbox"), (archive, "Archive"), (work_a, "Work"), (work_b, "Work"))]
+    # A stale folder name on a document must not become a choice once real rows exist.
+    service.docs = folders + [{"id": "d9", "name": "Survey", "type": "pdf", "pages": 3,
+                               "modified": "2026-10-01 09:12", "folder": "Gone"}]
+    window.reload_documents()
+    settle(app, window)
+    combo = library.folder_combo
+    assert [combo.itemText(i) for i in range(combo.count())] == \
+        ["Top level", "Archive", "Inbox", "Work (33333333)", "Work (44444444)"]
+    assert [combo.itemData(i) for i in range(combo.count())] == ["", archive, inbox, work_a, work_b]
+    assert combo.currentData() == inbox, "the one real Inbox is the default, even when empty"
+    assert "1 document and 4 folders" in library.count_label.text()
+
+    source = tmp_path / "notes.rmdoc"
+    source.write_bytes(b"PK")
+    window.dialogs.files = [str(source)]
+    combo.setCurrentIndex(combo.findData(archive))
+    library.upload()
+    settle(app, window)
+    assert ("upload", str(source), archive) in service.calls
+    assert combo.currentData() == archive, "an explicit choice survives the list reload"
+    assert "*.rmdoc" in UPLOAD_FILTER and "RMDOC" in library.upload_button.toolTip()
+
+    assert library.select_document(inbox)
+    assert not library.download_button.isEnabled() and "cannot be downloaded" in library.count_label.text()
+    window.dialogs.save_path = str(tmp_path / "never.pdf")
+    library.download()
+    settle(app, window)
+    assert service.count("download") == 0
+    assert library.select_document("d9") and library.download_button.isEnabled()
+
+    service.docs = [row for row in service.docs if row["id"] != inbox] + \
+        [dict(folders[0], id="55555555-aaaa-4aaa-8aaa-000000000005"),
+         dict(folders[0], id="66666666-aaaa-4aaa-8aaa-000000000006")]
+    library._folder_chosen = False
+    window.reload_documents()
+    settle(app, window)
+    assert combo.currentData() == "", "two Inboxes are ambiguous, so nothing is guessed"
+
+    service.docs = [{"id": "d1", "name": "Old", "type": "pdf", "pages": 1, "modified": 0, "folder": "Work"}]
+    window.reload_documents()
+    settle(app, window)
+    assert [combo.itemData(i) for i in range(combo.count())] == ["", "Work"], "names only without folder rows"
+
+
+def test_copy_pass_wording_and_archive_status_is_read_only_on_request(app, make):
+    window, service = demo_window(app, make)
+    library = window.pages["library"]
+    assert library.sync_button.text() == "Run copy pass"
+    about = " ".join(item.text() for item in library.findChildren(QLabel))
+    assert "Nothing is deleted on either side" in about and "device-copies" in about
+    assert "in step with" not in about and "Sync now" not in about
+    assert library.archive_card.isHidden(), "the simulator leaves this computer's archive timer alone"
+    library.refresh_archive()
+    settle(app, window)
+    assert service.count("archive_sync_status") == 0
+
+    window, service, _panel = live_window(app, make)
+    library = window.pages["library"]
+    window.navigate("library")
+    assert not library.archive_card.isHidden() and library.archive_label.text() == "Not read yet."
+    assert service.count("archive_sync_status") == 0, "never read until asked"
+    megabyte = 1024 * 1024
+    service.archive = {"available": True, "active": True, "stale": False, "large": True, "updated_at": 0,
+                       "bytes_done": 512 * megabyte, "bytes_total": 2048 * megabyte, "message": "Copying."}
+    library.archive_button.click()
+    settle(app, window)
+    text = library.archive_label.text()
+    assert service.calls == [("archive_sync_status",)], "disconnected, and nothing but the one read"
+    assert "Active, large transfer." in text and "USB-C" in text and "512.0 MB of 2.0 GB (25%)" in text
+
+    service.archive = {"available": True, "active": True, "stale": True, "large": True, "updated_at": 5,
+                       "bytes_done": 1, "bytes_total": 2, "message": "More than 10 minutes old."}
+    library.archive_button.click()
+    settle(app, window)
+    text = library.archive_label.text()
+    assert text.startswith("Stale.") and "Active" not in text and "USB-C" not in text and "%" not in text
+    for record, start in (({"available": True, "active": False, "invalid": True, "message": "Unreadable file."},
+                           "Unreadable."),
+                          ({"available": False, "active": False, "message": "No status was found."},
+                           "Not available."),
+                          ({"available": True, "active": False, "message": "Archive sync is idle."}, "Idle.")):
+        service.archive = record
+        library.archive_button.click()
+        settle(app, window)
+        assert library.archive_label.text().startswith(start)
+    service.fail["archive_sync_status"] = RuntimeError("Permission denied.")
+    library.archive_button.click()
+    settle(app, window)
+    assert "could not be read" in library.archive_label.text() and not window.uncertain
+
+
+def test_tailscale_is_an_explicit_choice_that_never_sends_the_password(app, make, tmp_path):
+    window, service, panel = live_window(app, make, password="tablet-secret")
+    assert panel.transport.currentData() == "ssh", "settings from before the selector stay on SSH"
+    assert [panel.transport.itemText(i) for i in range(2)] == ["USB / network SSH", "Tailscale SSH"]
+    assert panel.password.isEnabled() and panel.key_path.isEnabled()
+    panel.key_path.setText("/keys/id_ed25519")
+    panel.transport.setCurrentIndex(panel.transport.findData("tailscale"))
+    assert not panel.password.isEnabled() and not panel.key_path.isEnabled()
+    assert not panel.show_password.isEnabled() and not panel.choose_key.isEnabled()
+    note = panel.transport_note.text()
+    assert "never installs or starts Tailscale" in note and "browser" in note and "not used" in note
+    assert panel.host.text() == "10.11.99.1", "the address is the user's to change, never looked up"
+    panel.host.setText("")
+    assert not panel.ready() and not panel.check_button.isEnabled()
+    panel.host.setText("paper.example.ts.net")
+    assert panel.ready()
+    config = panel.config()
+    assert (config.transport_mode, config.password, config.host) == ("tailscale", "", "paper.example.ts.net")
+
+    panel.submit()
+    settle(app, window)
+    assert [call[0] for call in service.calls] == ["connect", "probe_host_key"]
+    assert panel.fingerprint.text() == FINGERPRINT and not panel.trust_button.isEnabled()
+    assert "recorded" in panel.trust_check.text() and "plugged" not in panel.trust_check.text()
+    panel.trust_check.setChecked(True)
+    panel.trust_button.click()
+    settle(app, window)
+    assert window.connection_mode == "live"
+    assert service.config.transport_mode == "tailscale" and service.config.password == ""
+    assert not panel.transport.isEnabled(), "the mode cannot change under a live connection"
+
+    window.settings.sync()
+    stored = (tmp_path / "settings.ini").read_text(encoding="utf-8")
+    assert "transport_mode=tailscale" in stored and "tablet-secret" not in stored
+    assert "password" not in stored.lower()
+    assert window.saved_config().transport_mode == "tailscale"
+    window.settings.setValue("connection/transport_mode", "vpn")
+    assert window.saved_config().transport_mode == "ssh", "an unknown saved mode falls back to SSH"
+
+
+def test_plugin_check_shortcuts_and_first_connection_notes(app, make):
+    window, service = demo_window(app, make)
+    art = window.pages["art"]
+    assert service.count("art_plugin_probe") == 0, "the plugin is asked only on request"
+    assert not art.plugin_ready.isChecked()
+    art.plugin_check_button.click()
+    settle(app, window)
+    assert service.count("art_plugin_probe") == 1
+    assert "Krita viewport plugin answered." in art.plugin_probe_note.text()
+    assert not art.plugin_ready.isChecked(), "an answer never ticks the user's own confirmation"
+    service.fail["art_plugin_probe"] = RuntimeError("The local plugin did not answer.")
+    art.plugin_check_button.click()
+    settle(app, window)
+    assert art.plugin_probe_note.text().startswith("The plugin did not answer.") and not window.uncertain
+
+    listed = dict(SHORTCUTS)
+    assert "tablet's own clipboard" in listed["Ctrl+C, Ctrl+P, Ctrl+W"]
+    assert "this computer's clipboard" in listed["Ctrl+V, Ctrl+Shift+V"] and "Cmd+V" in listed["Ctrl+V, Ctrl+Shift+V"]
+    assert "Ctrl+C, Ctrl+V, Ctrl+W" not in listed and "RMDOC" in listed["Ctrl+U"]
+
+    window, _service, panel = live_window(app, make)
+    notes = " ".join(item.text() for item in panel.before_card.findChildren(QLabel))
+    assert "Settings › Storage" in notes and "USB web interface" in notes
+    assert "reMarkable 1 and reMarkable 2 have no developer-mode switch" in notes
+    assert "https://developer.remarkable.com/documentation/developer-mode" in notes
+    for banned in ("update the firmware", "factory reset", "remount"):
+        assert banned not in notes.lower()
 
 
 def test_real_backend_demo_when_available(app):
@@ -1031,15 +1351,159 @@ def test_real_backend_demo_when_available(app):
     assert not window.runner.running
 
 
-def test_screenshots_when_requested(app, make, tmp_path):
+@pytest.fixture
+def real_demo(tmp_path, monkeypatch):
+    """A genuine SuiteService on a disposable simulated tablet, with network and launches blocked."""
+    import socket
+    import subprocess
+    backend = pytest.importorskip("paperdesk.backend")
+
+    def blocked(*_args, **_kwargs):
+        raise AssertionError("the simulation attempted external I/O")
+    monkeypatch.setattr(socket, "create_connection", blocked)
+    monkeypatch.setattr(subprocess, "Popen", blocked)
+    return backend.SuiteService.demo(tmp_path / "tablet")
+
+
+def _actions(service) -> list[str]:
+    return [operation["action"] for operation in service.simulator.operations]
+
+
+def test_full_path_through_the_window_on_the_real_backend(app, make, real_demo, tmp_path):
+    pytest.importorskip("PIL")
+    service = real_demo
+    window = make(service, demo=True)
+    settle(app, window)
+    setup, typing, library, art = (window.pages[name] for name in ("setup", "type", "library", "art"))
+    assert window.connection_mode == "simulation" and window.status["simulated"] is True
+    assert not window.supports("keyboard") and not typing.send_button.isEnabled()
+
+    def install_everything():
+        for check in setup.feature_checks.values():
+            check.setChecked(True)
+        setup.review_plan()
+        settle(app, window)
+        assert setup.install_button.isEnabled(), setup.plan_summary.text()
+        setup.install_button.click()
+        settle(app, window)
+    install_everything()
+    assert all(window.supports(feature) for feature in FEATURE_IDS), window.status_text
+
+    typing.text_edit.setPlainText("A portable “paper” workspace.")
+    typing.send_text()
+    settle(app, window)
+    typing.feed("key", "enter")
+    settle(app, window)
+    typing.add_page("cornell")
+    settle(app, window)
+    picture = _figure(tmp_path)
+    window.dialogs.files = [picture]
+    typing.paste_image_file()
+    settle(app, window)
+    typing.upload_sticker()
+    settle(app, window)
+    assert not window.status_text.startswith("Failed"), window.status_text
+
+    exported = tmp_path / "current.pdf"
+    window.dialogs.save_path = str(exported)
+    library.export_current()
+    settle(app, window)
+    assert exported.read_bytes().startswith(b"%PDF-")
+    window.dialogs.files = [str(exported)]
+    library.upload()
+    settle(app, window)
+    documents = service.documents()
+    assert library.table.topLevelItemCount() == len(documents) >= 4
+    assert library.select_document(documents[0]["id"])
+    window.dialogs.save_path = str(tmp_path / "download.pdf")
+    library.download()
+    settle(app, window)
+    assert (tmp_path / "download.pdf").is_file()
+    window.dialogs.save_path = str(tmp_path / "screen.png")
+    typing.save_screenshot()
+    settle(app, window)
+    assert (tmp_path / "screen.png").read_bytes().startswith(b"\x89PNG")
+
+    art.discover()
+    settle(app, window)
+    art.start_button.click()
+    settle(app, window)
+    assert window.art_state["active"] and service.art.status()["active"]
+    art.stop_mode()
+    settle(app, window)
+    assert not window.art_state["active"] and not service.art.status()["active"]
+
+    ink = typing.ink
+    window.dialogs.files = [picture]
+    ink.choose_source()
+    ink.prepare()
+    settle(app, window)
+    ink.probe()
+    settle(app, window)
+    assert ink.axis_ratio is not None and "Simulation" in ink.probe_note.text()
+    assert ink.preview_current(), ink.preview_note.text()
+    ink.draw_mark()
+    settle(app, window)
+    assert ink.calibrated, f"{ink.mark_note.text()} / {window.status_text}"
+    ink.confirm.setChecked(True)
+    ink.draw()
+    settle(app, window)
+    assert "no physical ink was drawn" in ink.outcome.text() and window.uncertain is None
+
+    setup.sandbox.reboot_button.click()
+    settle(app, window)
+    assert not window.supports("direct-paste") and not window.supports("art-display"), \
+        "a restart drops the extras that live in temporary settings"
+    assert not typing.clip_image_button.isEnabled() and not art.start_button.isEnabled()
+    ink.draw_mark()
+    settle(app, window)
+    assert "Check the pen" in ink.mark_note.text(), "the backend wants a new pen check after a restart"
+    assert window.uncertain is not None, "any interrupted ink holds further changes until dismissed"
+    window.dismiss_uncertain()
+    install_everything()
+    assert window.supports("direct-paste") and window.supports("art-display")
+    setup.uninstall()
+    settle(app, window)
+    assert not any(window.supports(feature) for feature in FEATURE_IDS)
+    assert window.uncertain is None and window.connected
+
+    actions = _actions(service)
+    for expected in ("type", "key", "native-page", "native-image", "native-import", "export",
+                     "screenshot", "probe-ink", "figure-ink", "reboot"):
+        assert expected in actions, f"{expected} never reached the simulated tablet: {actions}"
+    assert actions.count("figure-ink") == 2, "one calibration mark and one drawing, nothing after the restart"
+
+
+def test_real_backend_refuses_extras_on_a_fresh_remarkable_2(app, make, real_demo):
+    window = make(real_demo, demo=True)
+    settle(app, window)
+    setup = window.pages["setup"]
+    setup.sandbox.model.setCurrentIndex(1)
+    setup.sandbox.fresh_button.click()
+    settle(app, window)
+    assert window.service is not real_demo and window.status["model"] == "rm2"
+    assert window.service.config.host == "simulation", "a fresh tablet uses no saved address"
+    setup.feature_checks["direct-paste"].setChecked(True)
+    setup.review_plan()
+    settle(app, window)
+    assert not setup.install_button.isEnabled(), "an unsupported tablet cannot be installed to"
+    ink = window.pages["type"].ink
+    assert not ink.probe_button.isEnabled() and "exact verified" in ink.notice.text()
+
+
+def test_screenshots_when_requested(app, make, real_demo, tmp_path):
     target = os.environ.get("PAPERDESK_UI_SHOTS")
     if not target:
         pytest.skip("set PAPERDESK_UI_SHOTS to a directory to save page screenshots")
     out = Path(target)
     out.mkdir(parents=True, exist_ok=True)
-    window, service = demo_window(app, make)
-    service.installed.update(("keyboard", "art-display"))
-    window.refresh_status()
+    assert real_demo.install(list(FEATURE_IDS))["ok"]
+    window = make(real_demo, demo=True)
+    settle(app, window)
+    ink = window.pages["type"].ink
+    window.dialogs.files = [_figure(tmp_path)]
+    ink.choose_source()
+    ink.prepare()
     settle(app, window)
     for size in ((900, 650), (1180, 800)):
         window.resize(*size)
@@ -1051,17 +1515,70 @@ def test_screenshots_when_requested(app, make, tmp_path):
             window.navigate(page_id, section)
             for _ in range(4):
                 app.processEvents()
-            name = f"{size[0]}-{page_id}" + (f"-{section}" if section else "") + ".png"
-            assert window.grab().save(str(out / name))
-    live, _, panel = live_window(app, make)
+            name = f"{size[0]}-{page_id}" + (f"-{section}" if section else "")
+            assert window.grab().save(str(out / f"{name}.png"))
+            if page_id in ("art", "type", "library") and section in (None, "ink"):
+                # Long pages: also record what is below the fold, one screenful at a time.
+                bars = [area.verticalScrollBar() for area in window.pages[page_id].findChildren(QScrollArea)
+                        if area.isVisible() and area.verticalScrollBar().maximum() > 0]
+                for bar in bars[:1]:
+                    for part in range(2, 6):
+                        if bar.value() >= bar.maximum():
+                            break
+                        bar.setValue(min(bar.maximum(), bar.value() + bar.pageStep() - 40))
+                        app.processEvents()
+                        assert window.grab().save(str(out / f"{name}-{part}.png"))
+                    bar.setValue(0)
+    live, fake, panel = live_window(app, make)
     live.resize(1000, 700)
     live.show()
     for _ in range(3):
         app.processEvents()
     assert live.grab().save(str(out / "live-home.png"))
+
+    def grab(name: str, bottom: bool = False) -> None:
+        for _ in range(4):
+            app.processEvents()
+        if bottom:
+            for area in live.pages[live.current_page].findChildren(QScrollArea):
+                bar = area.verticalScrollBar()
+                if area.isVisible():
+                    bar.setValue(min(bar.maximum(), bar.pageStep() - 40))
+            app.processEvents()
+        assert live.grab().save(str(out / f"{name}.png"))
+
+    # The rest uses the recording test double, not a tablet: it shows the not-simulated wording.
+    for width, height in ((900, 650), (1180, 800)):
+        live.resize(width, height)
+        live.navigate("setup", "connect")
+        grab(f"{width}-live-connect-ssh")
+        grab(f"{width}-live-connect-ssh-2", bottom=True)
+        for area in live.pages["setup"].findChildren(QScrollArea):
+            area.verticalScrollBar().setValue(0)
+        panel.transport.setCurrentIndex(panel.transport.findData("tailscale"))
+        grab(f"{width}-live-connect-tailscale")
+        panel.transport.setCurrentIndex(panel.transport.findData("ssh"))
+    live.resize(1000, 700)
     panel.submit()
     settle(app, live)
     for _ in range(3):
         app.processEvents()
     assert live.grab().save(str(out / "live-trust.png"))
+    panel.trust_check.setChecked(True)
+    panel.trust_button.click()
+    settle(app, live)
+    fake.docs += [{"id": f"{digit * 8}-aaaa-4aaa-8aaa-00000000000{digit}", "name": name, "type": "folder",
+                   "pages": 0, "modified": "2026-09-30 08:00", "folder": ""}
+                  for digit, name in (("1", "Inbox"), ("2", "Archive"), ("3", "Work"), ("4", "Work"))]
+    fake.archive = {"available": True, "active": True, "stale": False, "large": True, "updated_at": 0,
+                    "bytes_done": 512 * 1024 * 1024, "bytes_total": 2048 * 1024 * 1024, "message": ""}
+    live.reload_documents()
+    settle(app, live)
+    live.pages["library"].refresh_archive()
+    settle(app, live)
+    for width, height in ((900, 650), (1180, 800)):
+        live.resize(width, height)
+        live.navigate("library")
+        grab(f"{width}-live-library")
+        grab(f"{width}-live-library-2", bottom=True)
     assert QGuiApplication.instance() is app

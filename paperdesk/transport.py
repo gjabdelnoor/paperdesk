@@ -3,6 +3,8 @@
 There is no auto-accept policy, external SSH process, or background tunnel. The
 tablet's USB web interface is reached by a direct-tcpip channel through the
 already authenticated connection, including when the SSH host is wireless.
+Explicit Tailscale mode launches only its nc byte-stream proxy and authenticates
+SSH with the Tailscale none method; it never installs or starts a VPN/browser.
 """
 from __future__ import annotations
 
@@ -12,9 +14,13 @@ import hashlib
 import http.client
 import json
 import os
+import queue
 import re
+import shutil
 import socket
 import stat
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -36,6 +42,13 @@ class HostTrustRequired(DeviceError):
     """The UI must display an observed fingerprint and request explicit trust."""
 
 
+class TailscaleAuthorizationRequired(DeviceError):
+    """Tailnet policy/check-mode authorization is pending or denied."""
+    def __init__(self, message: str, auth_url: str = ""):
+        self.auth_url = auth_url
+        super().__init__(message + (f" Sign-in link from the verified server: {auth_url}" if auth_url else ""))
+
+
 class UnknownMutation(DeviceError):
     """A remote write may have happened; do not replay it automatically."""
     no_retry = True
@@ -47,6 +60,8 @@ def state_directory(config: DeviceConfig) -> Path:
 
 
 def validate_config(config: DeviceConfig) -> None:
+    if config.transport_mode not in ("ssh", "tailscale"):
+        raise DeviceError("Choose SSH or the explicit Tailscale SSH transport mode.")
     host = config.host
     if not isinstance(host, str) or not host or len(host) > 253:
         raise DeviceError("Enter a tablet IP address or hostname.")
@@ -73,6 +88,166 @@ def validate_remote_path(path: str) -> str:
 def fingerprint(key: paramiko.PKey) -> str:
     digest = hashlib.sha256(key.asbytes()).digest()
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _tailscale_executable() -> str:
+    executable = shutil.which("tailscale")
+    if executable:
+        return executable
+    candidates = []
+    if sys.platform == "darwin":
+        # Use CLI links from a standalone install, rather than invoking an
+        # arbitrary App Store GUI executable as a byte-pipe helper.
+        candidates.extend((Path("/usr/local/bin/tailscale"), Path("/opt/homebrew/bin/tailscale")))
+    elif sys.platform == "win32":
+        for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+            if os.environ.get(variable):
+                candidates.append(Path(os.environ[variable]) / "Tailscale" / "tailscale.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    raise DeviceError("The Tailscale command-line client is unavailable. Install its standalone client, sign in to your tailnet, and select Tailscale mode explicitly.")
+
+
+class _ProcessSocket:
+    """Bounded, portable socket interface around an argv-only nc subprocess.
+
+    Windows anonymous pipes cannot use select(). Blocking pipe reads/writes run
+    in two owned threads with bounded queues; socket timeouts remain bounded,
+    and close terminates the proxy so no pending bytes can be sent later.
+    """
+    def __init__(self, argv: list[str], timeout: float = 10):
+        self._timeout = timeout
+        self._closed = threading.Event()
+        self._read_eof = threading.Event()
+        self._close_lock = threading.Lock()
+        self._incoming = queue.Queue(maxsize=16)
+        self._outgoing = queue.Queue(maxsize=2)
+        self._buffer = bytearray()
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            self.process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                            stderr=subprocess.DEVNULL, bufsize=0, shell=False,
+                                            creationflags=flags)
+        except OSError as exc:
+            raise DeviceError("Cannot launch the Tailscale nc proxy. Check its standalone client installation.") from exc
+        self._reader = threading.Thread(target=self._read_pipe, name="PaperDesk-tailnet-read", daemon=True)
+        self._writer = threading.Thread(target=self._write_pipe, name="PaperDesk-tailnet-write", daemon=True)
+        self._reader.start(); self._writer.start()
+
+    def _enqueue(self, item):
+        while not self._closed.is_set():
+            try:
+                self._incoming.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                pass
+
+    def _read_pipe(self):
+        try:
+            while not self._closed.is_set():
+                block = self.process.stdout.read(65536)
+                if not block:
+                    break
+                self._enqueue(block)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._read_eof.set()
+            self._enqueue(None)
+
+    def _write_pipe(self):
+        while not self._closed.is_set():
+            try:
+                data, result, done = self._outgoing.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                result["count"] = self.process.stdin.write(data)
+            except (OSError, ValueError) as error:
+                result["error"] = error
+            finally:
+                done.set()
+
+    def settimeout(self, timeout):
+        self._timeout = timeout
+
+    def recv(self, amount: int) -> bytes:
+        if amount <= 0:
+            return b""
+        if not self._buffer:
+            if self._closed.is_set() or self._read_eof.is_set() and self._incoming.empty():
+                return b""
+            try:
+                block = self._incoming.get(timeout=self._timeout)
+            except queue.Empty as exc:
+                raise socket.timeout("Tailscale proxy read timed out") from exc
+            if block is None:
+                return b""
+            self._buffer.extend(block)
+        result = bytes(self._buffer[:amount])
+        del self._buffer[:amount]
+        return result
+
+    def send(self, data: bytes) -> int:
+        if self._closed.is_set():
+            raise OSError("Tailscale proxy is closed")
+        result = {}
+        done = threading.Event()
+        # Paramiko uses a short polling read timeout. Pipe backpressure needs a
+        # separate bounded write allowance; cancellation still closes the pipe.
+        timeout = max(float(self._timeout or 10), 10)
+        try:
+            self._outgoing.put((bytes(data), result, done), timeout=timeout)
+        except queue.Full as exc:
+            self.close()
+            raise socket.timeout("Tailscale proxy write queue timed out") from exc
+        if not done.wait(timeout):
+            self.close()
+            raise socket.timeout("Tailscale proxy write timed out")
+        if "error" in result or not result.get("count"):
+            raise OSError("Tailscale proxy input pipe closed")
+        return result["count"]
+
+    def close(self):
+        if not self._close_lock.acquire(blocking=False):
+            return
+        try:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            while True:
+                try:
+                    _data, result, done = self._outgoing.get_nowait()
+                    result["error"] = OSError("Tailscale proxy was cancelled")
+                    done.set()
+                except queue.Empty:
+                    break
+            if self.process.poll() is None:
+                try:
+                    self.process.terminate()
+                except OSError:
+                    pass
+                try:
+                    self.process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self.process.kill(); self.process.wait(timeout=1)
+            for handle in (self.process.stdin, self.process.stdout):
+                try:
+                    handle.close()
+                except (OSError, ValueError):
+                    pass
+            for worker in (self._reader, self._writer):
+                if worker is not threading.current_thread():
+                    worker.join(0.2)
+        finally:
+            self._close_lock.release()
+
+
+def _connection_socket(config: DeviceConfig, timeout: float):
+    if config.transport_mode == "tailscale":
+        return _ProcessSocket([_tailscale_executable(), "nc", config.host, str(config.port)], timeout)
+    return socket.create_connection((config.host, config.port), timeout=timeout)
 
 
 class PortableLock:
@@ -140,18 +315,18 @@ def probe_host_key(config: DeviceConfig, timeout: float = 10) -> dict:
     connection = None
     session = None
     try:
-        connection = socket.create_connection((config.host, config.port), timeout=timeout)
+        connection = _connection_socket(config, timeout)
         session = paramiko.Transport(connection)
         session.banner_timeout = timeout
         session.start_client(timeout=timeout)
         key = session.get_remote_server_key()
-        return {"host": config.host, "port": config.port, "fingerprint": fingerprint(key), "key_type": key.get_name()}
+        return {"host": config.host, "port": config.port, "fingerprint": fingerprint(key), "key_type": key.get_name(), "transport_mode": config.transport_mode}
     except (OSError, paramiko.SSHException) as exc:
         raise DeviceError("Cannot observe the tablet SSH key. Check its address, developer mode, and connection.") from exc
     finally:
         if session is not None:
             session.close()
-        elif connection is not None:
+        if connection is not None:
             connection.close()
 
 
@@ -237,6 +412,7 @@ class SSHTransport:
     """Device transport. Construction never contacts a device."""
 
     MAX_READ = 64 * 1024 * 1024
+    FILE_OPEN_TIMEOUT = 30.0
     WRITE_ROOTS = ("/home/root/.local/lib/paperdesk", "/run/systemd/system",
                    "/home/root/.cache/remarkable-direct-paste", "/tmp/paperdesk-viewport")
 
@@ -245,28 +421,42 @@ class SSHTransport:
         self.config = config
         self.client = None
         self.host_fingerprint = ""
+        self._tailscale_session = None
+        self._proxy = None
         self._sftp = None
         self._streams: list[RemoteStream] = []
         self._streams_lock = threading.RLock()
         self._web_channels: list[paramiko.Channel] = []
+        self._opening_requests: list[dict] = []
+        self._sftp_channel = None
+        self._cancel_generation = 0
 
     @property
     def connected(self) -> bool:
+        if self._tailscale_session is not None:
+            return self._tailscale_session.is_active() and self._tailscale_session.is_authenticated()
         if self.client is None:
             return False
         session = self.client.get_transport()
         return bool(session and session.is_active() and session.is_authenticated())
 
     def connect(self) -> None:
+        validate_config(self.config)
         if self.connected:
             return
-        if self.client is not None:
+        if self.client is not None or self._tailscale_session is not None:
             self.close()
         expected = _load_trust(self.config).get(_host_id(self.config))
         if not expected:
             raise HostTrustRequired("This tablet is not paired. Observe its SSH fingerprint and confirm trust before connecting.")
+        with self._streams_lock:
+            generation = self._cancel_generation
+        if self.config.transport_mode == "tailscale":
+            self._connect_tailscale(expected,generation)
+            return
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(_FingerprintPolicy(expected))
+        self.client = client  # owned while banner/authentication is pending too
         try:
             client.connect(hostname=self.config.host, port=self.config.port,
                            username=self.config.username,
@@ -275,26 +465,68 @@ class SSHTransport:
                            timeout=10, banner_timeout=10, auth_timeout=15,
                            look_for_keys=not bool(self.config.key_path or self.config.password),
                            allow_agent=not bool(self.config.key_path or self.config.password))
-        except HostTrustRequired:
-            client.close()
+            if generation != self._cancel_generation:
+                raise DeviceError("The SSH connection request was cancelled. Reconnect explicitly to continue.")
+        except DeviceError:
+            self.close()
             raise
         except paramiko.AuthenticationException as exc:
-            client.close()
+            self.close()
             raise DeviceError("SSH authentication failed. Use the developer-mode password or the correct private key.") from exc
         except (paramiko.SSHException, OSError, ValueError) as exc:
-            client.close()
+            self.close()
             raise DeviceError("Cannot connect over SSH. Check developer mode, the tablet address, and the cable or network.") from exc
         self.client = client
         self.host_fingerprint = fingerprint(client.get_transport().get_remote_server_key())
 
+    def _connect_tailscale(self, expected: str, generation: int) -> None:
+        proxy = _connection_socket(self.config, 10)
+        session = paramiko.Transport(proxy)
+        session.banner_timeout = session.handshake_timeout = 10
+        session.auth_timeout = 15
+        self._proxy, self._tailscale_session = proxy, session
+        try:
+            if generation != self._cancel_generation:
+                raise DeviceError("The Tailscale connection request was cancelled before authentication.")
+            session.start_client(timeout=10)
+            observed = fingerprint(session.get_remote_server_key())
+            if observed != expected:
+                raise HostTrustRequired(f"The tablet host key changed. Observed {observed}. Verify it before pairing again.")
+            # Passwords and private keys are deliberately unused in this
+            # explicit mode; Tailscale policy authenticates the node identity.
+            session.auth_none(self.config.username)
+            if not session.is_authenticated():
+                raise paramiko.AuthenticationException("Tailscale authorization not confirmed")
+            if generation != self._cancel_generation:
+                raise DeviceError("The Tailscale connection request was cancelled. Reconnect explicitly to continue.")
+            self.host_fingerprint = observed
+        except HostTrustRequired:
+            self.close()
+            raise
+        except DeviceError:
+            self.close()
+            raise
+        except paramiko.AuthenticationException as exc:
+            banner = session.get_banner() or b""
+            if isinstance(banner, bytes):
+                banner = banner.decode("utf-8", "replace")
+            link = re.search(r"https://(?:login|console)\.tailscale\.com/[^\s<>\"']+", str(banner)[:4096])
+            self.close()
+            raise TailscaleAuthorizationRequired("Tailscale SSH authorization is unavailable or needs check-mode sign-in. Review your tailnet SSH policy and authorize it with the Tailscale client, then reconnect explicitly.", link.group(0) if link else "") from exc
+        except (OSError, EOFError, ValueError, paramiko.SSHException) as exc:
+            self.close()
+            raise DeviceError("Cannot connect through Tailscale nc. Check that its client is signed in, the tablet is online, and Tailscale SSH is enabled for your user.") from exc
+
     def close(self) -> None:
         self.cancel_streams()
-        if self._sftp is not None:
-            self._sftp.close()
-            self._sftp = None
-        if self.client is not None:
-            self.client.close()
-            self.client = None
+        owned = (self._sftp, self.client, self._tailscale_session, self._proxy)
+        self._sftp = self.client = self._tailscale_session = self._proxy = None
+        for item in owned:
+            if item is not None:
+                try:
+                    item.close()
+                except (OSError, EOFError, paramiko.SSHException):
+                    pass
 
     disconnect = close
 
@@ -306,23 +538,102 @@ class SSHTransport:
         """
         with self._streams_lock:
             streams, web = list(self._streams), list(self._web_channels)
+            opening = [request["channel"] or request["session"] for request in self._opening_requests]
+            sftp = self._sftp_channel
+            self._sftp = self._sftp_channel = None
+            self._cancel_generation += 1
             self._streams.clear()
             self._web_channels.clear()
-        for item in streams + web:
+        for item in streams + web + opening + ([sftp] if sftp is not None else []):
             try:
                 item.close()
             except (OSError, EOFError, paramiko.SSHException):
                 pass
+        if self.client is not None and not self.connected:
+            self.client.close()
+        if self._tailscale_session is not None and not self._tailscale_session.is_authenticated():
+            # GUI cancellation during handshake/authentication must terminate
+            # the proxy instead of waiting for a browser approval indefinitely.
+            if self._proxy is not None:
+                self._proxy.close()
 
     def _session(self):
         if not self.connected:
             raise DeviceError("Connect to a paired tablet first.")
-        return self.client.get_transport()
+        return self._tailscale_session if self._tailscale_session is not None else self.client.get_transport()
+
+    def _new_channel(self, timeout: float):
+        """Own channel open/ACK waits under one deadline and cancel watchdog.
+
+        Paramiko exec_command/invoke_subsystem wait on an Event without using
+        Channel.settimeout. Closing their owned channel unblocks that Event.
+        During a pending channel-open ACK no Channel is returned yet, so the
+        watchdog closes only this app's authenticated SSH session instead.
+        """
+        if not isinstance(timeout, (int,float)) or isinstance(timeout,bool) or timeout < 0:
+            raise DeviceError("A nonnegative device-operation timeout is required.")
+        session = self._session()
+        deadline = time.monotonic() + timeout
+        request = {"session":session,"channel":None,"expired":threading.Event()}
+        with self._streams_lock:
+            generation = self._cancel_generation
+            self._opening_requests.append(request)
+        def expire():
+            request["expired"].set()
+            with self._streams_lock:
+                owned = request["channel"] or request["session"]
+            try: owned.close()
+            except (OSError,EOFError,paramiko.SSHException): pass
+        timer = threading.Timer(max(0,deadline-time.monotonic()),expire)
+        timer.daemon = True; request["timer"] = timer; timer.start()
+        try:
+            channel = session.open_session(timeout=max(.001,min(timeout,15)))
+            with self._streams_lock:
+                request["channel"] = channel
+                cancelled = generation != self._cancel_generation
+            if request["expired"].is_set() or time.monotonic() >= deadline:
+                raise DeviceError("Timed out opening the SSH channel before any device command was sent.")
+            if cancelled:
+                raise DeviceError("The SSH channel request was cancelled before a device command was sent.")
+            channel.settimeout(max(.001,deadline-time.monotonic()))
+            return channel, deadline, request
+        except (OSError,EOFError,paramiko.SSHException) as exc:
+            self._finish_channel(request,close=True)
+            raise DeviceError("Opening the SSH channel timed out or was interrupted before any device command was sent.") from exc
+        except Exception:
+            self._finish_channel(request,close=True)
+            raise
+
+    def _finish_channel(self, request: dict, *, close: bool) -> None:
+        request["timer"].cancel()
+        with self._streams_lock:
+            if request in self._opening_requests:
+                self._opening_requests.remove(request)
+        if close and request["channel"] is not None:
+            try: request["channel"].close()
+            except (OSError,EOFError,paramiko.SSHException): pass
 
     def _files(self):
         self._session()
         if self._sftp is None:
-            self._sftp = self.client.open_sftp()
+            channel, _deadline, request = self._new_channel(self.FILE_OPEN_TIMEOUT)
+            completed = False
+            try:
+                # Set the timeout before subsystem negotiation and version
+                # exchange, rather than after from_transport has finished.
+                channel.invoke_subsystem("sftp")
+                files = paramiko.SFTPClient(channel)
+                if request["expired"].is_set() or time.monotonic() >= _deadline:
+                    raise DeviceError("Starting the tablet SFTP subsystem timed out.")
+                with self._streams_lock:
+                    if channel.closed:
+                        raise DeviceError("Starting the tablet SFTP subsystem was cancelled.")
+                    self._sftp, self._sftp_channel = files, channel
+                    completed = True
+            except (OSError, EOFError, paramiko.SSHException, paramiko.SFTPError) as exc:
+                raise DeviceError("The tablet SFTP subsystem is unavailable. For Tailscale SSH, check that its server permits SFTP and can launch its embedded tailscaled server.") from exc
+            finally:
+                self._finish_channel(request,close=not completed)
             self._sftp.get_channel().settimeout(30)
         return self._sftp
 
@@ -341,20 +652,23 @@ class SSHTransport:
                     mutation = True  # malformed typed script fails conservatively
             else:
                 mutation = False
-        session = self._session()
-        channel = session.open_session(timeout=min(timeout, 15))
-        channel.settimeout(timeout)
+        channel, deadline, request = self._new_channel(timeout)
         out, err = bytearray(), bytearray()
         try:
             channel.exec_command(script)
-            deadline = time.monotonic() + timeout
             # Drain both streams to avoid deadlock on a verbose command.
             while True:
+                if request["expired"].is_set() or time.monotonic() >= deadline:
+                    if mutation:
+                        raise UnknownMutation("The device command timed out after a possible change. Inspect the tablet before any further setup; no automatic retry is allowed.")
+                    raise DeviceError("The read-only device command timed out. Check the tablet connection.")
                 if channel.recv_ready():
                     out.extend(channel.recv(65536))
                 if channel.recv_stderr_ready():
                     err.extend(channel.recv_stderr(65536))
                 if len(out) + len(err) > self.MAX_READ:
+                    if mutation:
+                        raise UnknownMutation("A device change exceeded its output limit without a final receipt. Inspect the tablet; the command will not be replayed.")
                     raise DeviceError("Device command produced too much output.")
                 if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
                     break
@@ -372,28 +686,34 @@ class SSHTransport:
         except (OSError, EOFError, paramiko.SSHException) as exc:
             if mutation:
                 raise UnknownMutation("The SSH connection was lost during a possible change. Inspect the tablet before any further setup; the command will not be replayed.") from exc
+            if request["expired"].is_set():
+                raise DeviceError("The read-only device command timed out while waiting for acknowledgement.") from exc
             raise DeviceError("The SSH connection was interrupted. Inspect any in-progress action before retrying.") from exc
         finally:
-            try:
-                channel.close()
-            except (OSError, EOFError, paramiko.SSHException):
-                pass
+            self._finish_channel(request,close=True)
 
     def stream(self, script: str, timeout: float = 30) -> RemoteStream:
         if not isinstance(script, str) or not script or "\x00" in script:
             raise DeviceError("Invalid device command.")
-        channel = self._session().open_session(timeout=10)
-        channel.settimeout(timeout)
+        channel, deadline, request = self._new_channel(timeout)
+        completed = False
         try:
             channel.exec_command(script)
+            if request["expired"].is_set() or time.monotonic() >= deadline:
+                raise DeviceError("Starting the tablet input stream timed out before input was sent.")
             stream = RemoteStream(channel)
             with self._streams_lock:
+                if channel.closed:
+                    raise DeviceError("Starting the tablet input stream was cancelled before input was sent.")
                 self._streams = [item for item in self._streams if not item.closed]
                 self._streams.append(stream)
+                completed = True
+            channel.settimeout(timeout)
             return stream
         except (OSError, EOFError, paramiko.SSHException) as exc:
-            channel.close()
             raise DeviceError("Cannot start the tablet input stream.") from exc
+        finally:
+            self._finish_channel(request,close=not completed)
 
     start = stream
 
@@ -529,6 +849,8 @@ class SSHTransport:
             connection.sock = channel
             yield connection
         except (OSError, EOFError, paramiko.SSHException, http.client.HTTPException) as exc:
+            if self.config.transport_mode == "tailscale":
+                raise DeviceError("Tablet web forwarding failed. Enable its native USB web interface and permit local port forwarding in the Tailscale SSH policy.") from exc
             raise DeviceError("Tablet web interface did not answer. Enable Settings → Storage → USB web interface.") from exc
         finally:
             if connection is not None:

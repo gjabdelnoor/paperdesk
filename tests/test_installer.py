@@ -38,6 +38,7 @@ def test_advanced_pin_refused_before_writes(setup,fault):
 
 def test_install_repeat_reboot_uninstall_preserves_external_configuration(setup):
     sim,installer=setup;external="/run/systemd/system/xochitl.service.d/site.conf"
+    before = sim.documents()
     sim.write_bytes(external,b"[Service]\nEnvironment=OTHER=value\n")
     result=installer.install(["keyboard","touch","direct-paste"])
     manifest=json.loads(sim.read_bytes(result["manifest"]));assert manifest["owner"]=="paperdesk"
@@ -46,7 +47,7 @@ def test_install_repeat_reboot_uninstall_preserves_external_configuration(setup)
     assert repeated["backup"] and sim.exists(repeated["backup"]+"/manifest.json")
     assert sim.read_bytes(external)==b"[Service]\nEnvironment=OTHER=value\n"
     assert installer.uninstall()["ok"] and not sim.exists(LOADER_CONF)
-    assert not sim.exists(RECOVERY_UNIT) and len(sim.documents())==2
+    assert not sim.exists(RECOVERY_UNIT) and sim.documents() == before
     assert sim.read_bytes(external)==b"[Service]\nEnvironment=OTHER=value\n"
     assert installer.uninstall()["ok"]
 
@@ -54,10 +55,11 @@ def test_install_repeat_reboot_uninstall_preserves_external_configuration(setup)
 @pytest.mark.parametrize("fault",["write-failure","manifest-corrupt","activation-failure"])
 def test_partial_failure_rolls_back_fresh_install(setup,fault):
     sim,installer=setup;sim.set_fault(fault)
+    before = sim.documents()
     with pytest.raises(InstallerError,match="restored"):installer.install(["keyboard","direct-paste"])
     assert not sim.exists(APP_ROOT+"/current")
     assert not sim.exists(LOADER_CONF) and not sim.exists(RECOVERY_UNIT)
-    assert len(sim.documents())==2
+    assert sim.documents() == before
 
 
 def test_failed_upgrade_restores_previous_manifest_and_runtime(setup):
@@ -169,3 +171,13 @@ def test_first_install_preserves_unowned_runtime_files(setup, path):
         installer.install(["keyboard", "direct-paste"])
     assert sim.read_bytes(path) == original
     assert not any(event["action"] == "write" for event in sim.operations)
+
+
+def test_distinct_paper_pro_move_is_not_misclassified(setup, monkeypatch):
+    sim, installer = setup
+    original = sim.run
+    def observed(script, timeout=30):
+        return original(script, timeout).replace("model=reMarkable Paper Pro", "model=reMarkable Paper Pro Move")
+    monkeypatch.setattr(sim, "run", observed)
+    assert installer.probe()["model"] == "unsupported"
+    assert not installer.plan(["keyboard", "direct-paste"])["compatible"]

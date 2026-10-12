@@ -108,7 +108,7 @@ class SuiteService:
     def __init__(self, config: DeviceConfig):
         self.config = config
         self._state_base = state_directory(config)
-        endpoint = f"{config.host.lower()}:{config.port}:{config.username}"
+        endpoint = f"{config.transport_mode}:{config.host.lower()}:{config.port}:{config.username}"
         self.state_dir = self._state_base / "devices" / ("endpoint-" + hashlib.sha256(endpoint.encode("utf-8")).hexdigest())
         self.transport = SSHTransport(config)
         self.simulator = None
@@ -279,7 +279,7 @@ class SuiteService:
     def status(self) -> dict:
         if not self._connected:
             return {"connected": False, "simulated": self.simulated, "model": "", "firmware": "", "host": self.config.host,
-                    "transport": "Simulation" if self.simulated else "SSH", "capabilities": {}, "active_document": {}, "message": "Disconnected"}
+                    "transport": "Simulation" if self.simulated else "Tailscale SSH" if self.config.transport_mode == "tailscale" else "SSH", "capabilities": {}, "active_document": {}, "message": "Disconnected"}
         self._require_connected()
         if self.simulated:
             result = dict(self.simulator.status())
@@ -328,7 +328,7 @@ class SuiteService:
         art = self.art.status()
         capabilities.update({"art-" + key.replace("_", "-"): value for key, value in art.get("capabilities", {}).items() if isinstance(value, bool) and key != "art_display"})
         return {"connected": True, "simulated": False, "model": model, "firmware": probe.get("firmware", "unknown"),
-                "host": self.config.host, "transport": "SSH over USB" if self.config.host == "10.11.99.1" else "SSH over network",
+                "host": self.config.host, "transport": "Tailscale SSH via nc" if self.config.transport_mode == "tailscale" else "SSH over USB" if self.config.host == "10.11.99.1" else "SSH over network",
                 "capabilities": capabilities, "active_document": active, "art": art,
                 "message": "Connected. Advanced features require an explicitly installed compatible extension."}
 
@@ -1041,29 +1041,79 @@ class SuiteService:
     def refresh(self) -> dict:
         self._require_connected()
         if self.simulated:
-            return self.simulator.refresh()
+            with self._input_job():
+                return self.simulator.refresh()
         probe = self.installer.probe()
         if probe.get("model") not in ("paper-pro", "Paper Pro", "reMarkable Paper Pro"):
             raise DeviceError("The verified full-screen refresh method currently supports Paper Pro only.")
         if time.monotonic() - self._last_refresh < 8:
             raise DeviceError("Wait a few seconds for the previous refresh to finish.")
-        with PortableLock(self.state_dir / "writer.lock"):
+        with self._input_job(), PortableLock(self.state_dir / "writer.lock"):
+            cursor = self._refresh_cursor()
+            self._check_cancelled()
             identifier = uuid.uuid4().hex
-            marker = f"/run/paperdesk-refresh-{identifier}.ok"
-            command = ("set -e; orig=$(cat /sys/power/autosleep); "
-                       "restore() { printf '%s\\n' \"$orig\" > /sys/power/autosleep || true; }; trap restore EXIT; "
+            marker = f"/run/paperdesk-refresh-{identifier}.json"
+            receipt = {"request_id": identifier, "cursor": cursor, "suspended": True, "autosleep_restored": True, "nap_seconds": 2}
+            command = ("set -e; orig=$(cat /sys/power/autosleep); restored=0; "
+                       "restore() { if printf '%s\\n' \"$orig\" > /sys/power/autosleep; then restored=1; fi; }; trap restore EXIT; "
                        "echo off > /sys/power/autosleep; echo 1 > /sys/bus/i2c/devices/1-0048/enable_nowait; "
-                       f"syspowernap 2; printf ok > {marker}")
+                       "syspowernap 2; restore; test \"$restored\" = 1; trap - EXIT; "
+                       f"journalctl -k --after-cursor {shlex.quote(cursor)} --no-pager 2>/dev/null | grep -Fq 'Enter suspend'; "
+                       f"umask 077; printf '%s\\n' {shlex.quote(json.dumps(receipt, sort_keys=True))} > {marker}.tmp; mv {marker}.tmp {marker}")
+            local = self.state_dir / "refreshes" / f"{identifier}.json"
+            operation = {"request_id": identifier, "cursor": cursor, "receipt": marker, "state": "attempted", "started_at": time.time()}
+            atomic_json(local, operation)
             self._last_refresh = time.monotonic()
             try:
-                self.transport.run(f"systemd-run --unit=paperdesk-refresh-{identifier} --no-block sh -c {shlex.quote(command)}")
-                time.sleep(6)
-                if self.transport.run(f"test -f {marker} && cat {marker}").strip() != "ok":
-                    raise DeviceError("The tablet did not confirm suspend and wake.")
-                self.transport.run(f"rm -f {marker}")
+                try:
+                    self.transport.run(f"systemd-run --unit=paperdesk-refresh-{identifier} --no-block sh -c {shlex.quote(command)}", timeout=15, mutation=True)
+                except DeviceError:
+                    # The nap may drop SSH before launch acknowledgement. Only
+                    # read-only receipt/journal verification follows; no nap is
+                    # sent a second time.
+                    pass
+                confirmed = False
+                for wait in (6, 3):
+                    if self._cancel_event.wait(wait):
+                        raise UnknownMutation("Refresh verification was cancelled after scheduling. The detached unit still restores autosleep; inspect the screen. No nap will be replayed.")
+                    if not self.transport.connected:
+                        self.transport.connect()  # verifies saved key; read-only reconnect
+                    try:
+                        confirmed = self._verify_refresh(cursor, identifier, marker)
+                    except DeviceError:
+                        confirmed = False
+                    if confirmed:
+                        break
+                if not confirmed:
+                    raise UnknownMutation("No new suspend entry and matching restored-autosleep receipt could be verified. Inspect the tablet; the nap will not be retried automatically.")
             except DeviceError as exc:
+                operation["state"] = "unknown"
+                atomic_json(local, operation)
+                if isinstance(exc, UnknownMutation):
+                    raise
                 raise UnknownMutation("Refresh could not be confirmed after the tablet nap. Wait, inspect the screen, and reconnect if needed; no automatic retry occurs.") from exc
-            return {"ok": True, "message": "Paper Pro suspend and wake confirmed; the screen refreshed."}
+            operation["state"] = "confirmed"
+            atomic_json(local, operation)
+            return {"ok": True, "message": "Paper Pro suspend and wake confirmed from a new kernel journal entry; original autosleep restored.", "request_id": identifier, "verified_by": "journal-cursor-and-restoration-receipt"}
+
+    def _refresh_cursor(self) -> str:
+        raw = self.transport.run("journalctl -k -n 0 --show-cursor --no-pager 2>/dev/null", timeout=15)
+        matches = [line.split("cursor: ", 1)[1].strip() for line in raw.splitlines() if line.startswith(("-- cursor: ", "cursor: "))]
+        if len(matches) != 1 or not re.fullmatch(r"[^\x00-\x1f]{1,4096}", matches[0]):
+            raise DeviceError("The tablet kernel journal cursor is unavailable. Refresh was refused before scheduling a nap.")
+        return matches[0]
+
+    def _verify_refresh(self, cursor: str, identifier: str, marker: str) -> bool:
+        raw = self.transport.run(f"journalctl -k --after-cursor {shlex.quote(cursor)} --no-pager 2>/dev/null | grep -Fc 'Enter suspend' || true", timeout=15)
+        try:
+            if int(raw.strip()) < 1:
+                return False
+        except ValueError:
+            return False
+        receipt = _json_bytes(self.transport.read_bytes(marker), "refresh receipt")
+        return (receipt.get("request_id") == identifier and receipt.get("cursor") == cursor
+                and receipt.get("suspended") is True and receipt.get("autosleep_restored") is True
+                and receipt.get("nap_seconds") == 2)
 
     def sync(self, folder: str) -> dict:
         """One explicit bidirectional copy pass, with no deletion or watcher."""
@@ -1086,6 +1136,14 @@ class SuiteService:
             output = exports / f"{_safe_name(document['name'])}_{document['id'][:8]}.pdf"
             copied.append(self._export(document["id"], str(output), document["name"]))
         return {"ok": True, "message": "Explicit sync copied local imports and native tablet PDF exports. Originals were preserved.", "uploaded": len(imported), "downloaded": len(copied), "path": str(exports), "mode": "copy-only"}
+
+    def archive_sync_status(self) -> dict:
+        """Read the pre-existing Linux timer; simulation never reads host status."""
+        if self.simulated:
+            return {"available": False, "active": False,
+                    "message": "Simulation leaves the existing archive-sync timer alone."}
+        from .archive_status import read_archive_status
+        return read_archive_status()
 
     def installer_plan(self, features: list[str]) -> dict:
         return self.installer.plan(features)
@@ -1134,6 +1192,9 @@ class SuiteService:
 
     def art_status(self) -> dict:
         return self.art.status()
+
+    def art_plugin_probe(self) -> dict:
+        return self.art.probe_plugin()
 
     def set_art_program(self, application: str, path: str) -> dict:
         return self.art.set_program_path(application, path)

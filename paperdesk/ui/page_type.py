@@ -24,9 +24,10 @@ TEMPLATES = [("cornell", "Cornell", "Cues, notes, summary"), ("grid", "Grid", "S
              ("lined", "Lined", "Ruled lines"), ("blank", "Blank", "An empty page")]
 UNICODE_NOTE = (
     "Text is typed on the tablet as presses of a US keyboard. Letters, digits and the punctuation "
-    "printed on a US keyboard arrive exactly. Accented letters, emoji and other scripts have no key, "
-    "so the tablet may skip or refuse them. PaperDesk never swaps a character for a look-alike and "
-    "shows what the tablet reported.")
+    "printed on a US keyboard arrive exactly. Curly quotes, long dashes, the ellipsis character and "
+    "non-breaking spaces are typed as their plain US equivalents. Accented letters, emoji and other "
+    "scripts have no key: PaperDesk refuses the whole text before sending any of it, so you can "
+    "replace them.")
 
 # (unshifted, shifted or key id, width in key units).  Every row is 15 units wide.
 _ROWS = [
@@ -135,6 +136,7 @@ class LiveCapture(QFrame):
 
     text = Signal(str)
     key = Signal(str)
+    clipboard = Signal()
     stopped = Signal()
 
     def __init__(self):
@@ -195,7 +197,10 @@ class LiveCapture(QFrame):
                  Qt.Key.Key_Tab: "tab", Qt.Key.Key_Escape: "escape", Qt.Key.Key_Left: "left",
                  Qt.Key.Key_Right: "right", Qt.Key.Key_Up: "up", Qt.Key.Key_Down: "down"}
         if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
-            combo = {Qt.Key.Key_C: "copy", Qt.Key.Key_V: "paste", Qt.Key.Key_W: "close"}.get(key)
+            if key == Qt.Key.Key_V:
+                self.clipboard.emit()
+                return
+            combo = {Qt.Key.Key_C: "copy", Qt.Key.Key_P: "paste", Qt.Key.Key_W: "close"}.get(key)
             if combo:
                 self.key.emit(combo)
             return
@@ -247,27 +252,109 @@ class TemplateButton(QAbstractButton):
 
 
 class TouchSurface(QWidget):
-    """A portrait sheet; a click reports its position as fractions of the page."""
+    """A captured contact forwards normalized down/move/up, including release."""
 
     tapped = Signal(float, float)
+    contacted = Signal(str, float, float)
+    cancelled = Signal(float, float)
 
     def __init__(self):
         super().__init__()
         self.setAccessibleName("Touch surface")
-        self.setAccessibleDescription("Click to tap the same place on the tablet screen")
+        self.setAccessibleDescription("Click or drag to touch the tablet. Arrow keys move the cursor; Enter presses or releases; Escape releases.")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFixedSize(240, 320)
         self.last: tuple[float, float] | None = None
+        self._contact = False
+
+    def _position(self, event) -> tuple[float, float]:
+        return (min(max(event.position().x() / self.width(), 0.0), 1.0),
+                min(max(event.position().y() / self.height(), 0.0), 1.0))
+
+    def mousePressEvent(self, event) -> None:
+        if (self.isEnabled() and event.button() == Qt.MouseButton.LeftButton
+                and self.rect().contains(event.position().toPoint())):
+            continuing = self._contact
+            self._contact = True
+            self.last = self._position(event)
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            self.grabMouse()
+            self.update()
+            self.contacted.emit("move" if continuing else "down", *self.last)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._contact:
+            self.last = self._position(event)
+            self.update()
+            self.contacted.emit("move", *self.last)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
 
     def keyPressEvent(self, event) -> None:
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space) and self.isEnabled():
-            self._tap(0.5, 0.5)
+        if event.key() == Qt.Key.Key_Escape:
+            self.end_contact(cancelled=True)
+        elif event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down) and self.isEnabled():
+            step = .05 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else .01
+            dx, dy = {Qt.Key.Key_Left: (-step, 0), Qt.Key.Key_Right: (step, 0),
+                      Qt.Key.Key_Up: (0, -step), Qt.Key.Key_Down: (0, step)}[event.key()]
+            x, y = self.last or (0.5, 0.5)
+            self.last = (min(max(x + dx, 0.0), 1.0), min(max(y + dy, 0.0), 1.0))
+            self.update()
+            if self._contact:
+                self.contacted.emit("move", *self.last)
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.isEnabled():
+            if self._contact:
+                self.end_contact()
+            else:
+                self._contact = True
+                self.last = self.last or (0.5, 0.5)
+                self.contacted.emit("down", *self.last)
+        elif event.key() == Qt.Key.Key_Space and self.isEnabled():
+            if self._contact:
+                self.end_contact()
+            else:
+                self._tap(*(self.last or (0.5, 0.5)))
         else:
             super().keyPressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        if self.isEnabled() and self.rect().contains(event.position().toPoint()):
-            self._tap(event.position().x() / self.width(), event.position().y() / self.height())
+        if self._contact and event.button() == Qt.MouseButton.LeftButton:
+            self.last = self._position(event)  # releasing outside the sheet still releases
+            self.end_contact()
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def end_contact(self, *, emit: bool = True, cancelled: bool = False) -> None:
+        if not self._contact:
+            return
+        self._contact = False  # releaseMouse's UngrabMouse cannot release twice
+        if QWidget.mouseGrabber() is self:
+            self.releaseMouse()
+        if emit:
+            if cancelled:
+                self.cancelled.emit(*(self.last or (0.5, 0.5)))
+            else:
+                self.contacted.emit("up", *(self.last or (0.5, 0.5)))
+
+    def focusOutEvent(self, event) -> None:
+        self.end_contact(cancelled=True)
+        super().focusOutEvent(event)
+
+    def event(self, event) -> bool:
+        if event.type() in (QEvent.Type.UngrabMouse, QEvent.Type.WindowDeactivate,
+                             QEvent.Type.Hide, QEvent.Type.Close):
+            self.end_contact(cancelled=True)
+        return super().event(event)
+
+    def changeEvent(self, event) -> None:
+        if event.type() == QEvent.Type.EnabledChange and not self.isEnabled():
+            self.end_contact(cancelled=True)
+        super().changeEvent(event)
 
     def _tap(self, x: float, y: float) -> None:
         self.last = (min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0))
@@ -294,6 +381,10 @@ class TypePage(Page):
         self._feeding = False
         self._feeding_live = False
         self._live_cancel_requested = False
+        self._touch_pending: list[tuple[str, float, float]] = []
+        self._touch_sending = False
+        self._touch_outstanding = False
+        self._touch_release_requested = False
         self.sections = Sections("Type sections")
         self.col.addWidget(self.sections, 1)
         self.sections.add("write", "Write", self._build_write())
@@ -360,6 +451,7 @@ class TypePage(Page):
         self.live = LiveCapture()
         self.live.text.connect(lambda t: self.feed("text", t, live=True))
         self.live.key.connect(lambda k: self.feed("key", k, live=True))
+        self.live.clipboard.connect(self.paste_desktop_clipboard)
         self.live.stopped.connect(self._live_stopped)
         live.add(self.live)
         self.live_button = button("Start live keyboard", None, "Send each key press as you type")
@@ -449,12 +541,15 @@ class TypePage(Page):
 
     def _build_touch(self) -> QWidget:
         holder, column = self._column()
-        card = Card("Touch surface", "Click the sheet to tap the same spot on the tablet's screen. "
-                                     "Each click sends one touch down and one touch up.")
+        card = Card("Touch surface", "Click or drag the sheet to touch the same spot on the tablet's screen. "
+                                     "Releasing the mouse or changing focus releases the touch. "
+                                     "Arrows move the cursor; Enter presses or releases, and Escape releases.")
         self.touch_notice = card.add(label("", "warn"))
         self.touch_notice.setAccessibleName("Touch forwarding availability")
         self.touch = TouchSurface()
         self.touch.tapped.connect(self.tap)
+        self.touch.contacted.connect(self._touch_event)
+        self.touch.cancelled.connect(self._cancel_touch)
         row = QHBoxLayout()
         row.addWidget(self.touch)
         row.addStretch(1)
@@ -528,7 +623,7 @@ class TypePage(Page):
                             "touch call, so the surface stays off.")
         else:
             touch_notice = ""
-        self.touch.setEnabled(not touch_notice)
+        self.touch.setEnabled(not touch_notice and not self._touch_release_requested)
         self.touch_notice.setText(touch_notice)
         self.touch_notice.setVisible(bool(touch_notice))
 
@@ -594,22 +689,53 @@ class TypePage(Page):
         self._pending = [item for item in self._pending if not item[2]]
         if self._feeding_live:
             self._live_cancel_requested = True
-            current = self.win.runner.current
-            if current is not None and current.name in ("live-type-key", "live-send-key"):
-                self.win.runner.cancel_current()
-                self.win.cancel_service_inputs()
-            self.win.runner.cancel_waiting(lambda job: job.name in ("live-type-key", "live-send-key"))
+        live_jobs = {"live-type-key", "live-send-key", "live-paste-image"}
+        current = self.win.runner.current
+        if current is not None and current.name in live_jobs:
+            self.win.runner.cancel_current()
+            self.win.cancel_service_inputs()
+        self.win.runner.cancel_waiting(lambda job: job.name in live_jobs)
 
     def stop_forwarding(self) -> None:
         """Disconnect/close drops all pending input before signaling stop."""
         self._pending.clear()
         self.live.stop()
+        self._touch_pending = [item for item in self._touch_pending if item[0] != "move"]
+        self.touch.end_contact(cancelled=True)
+        if self._touch_outstanding and not self._touch_release_requested:
+            self._touch_event("up", *(self.touch.last or (0.5, 0.5)))
+
+    def paste_desktop_clipboard(self) -> None:
+        """Ctrl+V/Shift+V preserves live input ordering and uses host content."""
+        image = QGuiApplication.clipboard().image()
+        if not image.isNull():
+            if not self._can("direct-paste", "image paste"):
+                return
+            path = self.win.temp_dir() / f"clipboard-{uuid.uuid4().hex[:10]}.png"
+            if not image.save(str(path), "PNG"):
+                self.win.notify("error", "The clipboard image could not be prepared for sending.")
+                return
+            self.feed("image", str(path), live=True)
+        else:
+            text = QGuiApplication.clipboard().text()
+            if text:
+                self.feed("text", text, live=True)
+            else:
+                self.win.notify("info", "The clipboard holds no text or image, so nothing was sent.")
 
     def feed(self, kind: str, value: str, *, live: bool = False) -> None:
         """Queue one key or some text; order is kept and a failure drops the rest."""
-        if not self._can("keyboard", "keyboard forwarding"):
+        if not self._can("direct-paste" if kind == "image" else "keyboard",
+                         "image paste" if kind == "image" else "keyboard forwarding"):
             return
-        if kind == "text" and self._pending and self._pending[-1][0] == "text" and self._pending[-1][2] == live:
+        merging = kind == "text" and self._pending and self._pending[-1][0] == "text" and self._pending[-1][2] == live
+        pending_text = sum(len(item[1]) for item in self._pending if item[0] == "text")
+        if (len(self._pending) >= 32 and not merging) or (kind == "text" and pending_text + len(value) > 100000):
+            self.win.notify("warn", "Input backlog is full. The later input was not queued; wait for the tablet before sending more.")
+            if live:
+                self.live.stop()
+            return
+        if merging:
             self._pending[-1] = ("text", self._pending[-1][1] + value, live)
         else:
             self._pending.append((kind, value, live))
@@ -624,6 +750,10 @@ class TypePage(Page):
         if kind == "text":
             started = self.win.run("live-type-key" if live else "type-key", lambda s: s.type_text(value), mutation=True, dedupe=False,
                                    label=f"Type {len(value)} character{'' if len(value) == 1 else 's'}",
+                                   on_done=self._fed, on_error=self._feed_failed)
+        elif kind == "image":
+            started = self.win.run("live-paste-image" if live else "paste-image", lambda s: s.paste_image(value),
+                                   mutation=True, label="Paste the clipboard image",
                                    on_done=self._fed, on_error=self._feed_failed)
         else:
             started = self.win.run("live-send-key" if live else "send-key", lambda s: s.send_key(value), mutation=True, dedupe=False,
@@ -696,7 +826,8 @@ class TypePage(Page):
         return True
 
     def _send_sticker(self, path: str, text: str) -> None:
-        self.win.run("sticker", lambda s: s.create_sticker(path, ""), mutation=True,
+        folder = str(self.win.pages["library"].folder_combo.currentData() or "")
+        self.win.run("sticker", lambda s: s.create_sticker(path, folder), mutation=True,
                      key=f"sticker:{path}", label=text,
                      on_done=lambda result: None if isinstance(result, dict) and result.get("ok") is False
                      else self.win.reload_documents(quiet=True))
@@ -769,16 +900,81 @@ class TypePage(Page):
                      on_done=lambda _r: self.win.refresh_status_quietly())
 
     def tap(self, x: float, y: float) -> None:
-        method = self.touch_method()
-        if not method or not self._can("touch", "touch forwarding"):
+        if self.touch_method() == "tap":
+            if self._can("touch", "touch forwarding"):
+                self.win.run("tap", lambda service: service.tap(x, y), mutation=True,
+                             label=f"Tap at {x:.0%} across, {y:.0%} down")
             return
+        self._touch_event("down", x, y)
+        self._touch_event("up", x, y)
 
-        def send(service: Any) -> Any:
-            if method == "tap":
-                return service.tap(x, y)
-            service.touch("down", x, y)
-            return service.touch("up", x, y)
-        self.win.run("tap", send, mutation=True, label=f"Tap at {x:.0%} across, {y:.0%} down")
+    def _touch_event(self, phase: str, x: float, y: float) -> None:
+        if phase == "down":
+            if self._touch_outstanding or self.touch_method() != "touch" or not self._can("touch", "touch forwarding"):
+                self.touch.end_contact(emit=False)
+                if self._touch_outstanding:
+                    self.win.notify("warn", "Wait for the previous touch to release before starting another contact.")
+                return
+            self._touch_outstanding = True
+            self._touch_release_requested = False
+            self._touch_pending.append((phase, x, y))
+        elif not self._touch_outstanding or self._touch_release_requested:
+            return
+        elif phase == "move":
+            # At most one unsent move survives; slow transport cannot build a
+            # delayed drag that keeps changing the tablet after mouse release.
+            if self._touch_pending and self._touch_pending[-1][0] == "move":
+                self._touch_pending[-1] = (phase, x, y)
+            else:
+                self._touch_pending.append((phase, x, y))
+        elif phase == "up":
+            self._touch_release_requested = True
+            self._touch_pending.append((phase, x, y))
+            self.touch.setEnabled(False)
+        self._touch_pump()
+
+    def _cancel_touch(self, x: float, y: float) -> None:
+        self._touch_pending = [item for item in self._touch_pending if item[0] != "move"]
+        self._touch_event("up", x, y)
+
+    def _touch_pump(self) -> None:
+        if self._touch_sending or not self._touch_pending:
+            return
+        phase, x, y = self._touch_pending.pop(0)
+        self._touch_sending = True
+        def call(service):
+            try:
+                return service.touch(phase, x, y)
+            except Exception:
+                # An uncertain release is never resent. Closing the helper's
+                # input stream releases its kernel touch device instead.
+                cancel = getattr(service, "cancel_current", None)
+                if callable(cancel):
+                    cancel()
+                raise
+        started = self.win.run(f"touch-{phase}", call, mutation=True, cleanup=phase == "up",
+                               needs_connection=phase != "up", label="Release touch" if phase == "up" else "Forward touch",
+                               on_done=lambda result: self._touch_done(phase, result), on_error=self._touch_failed)
+        if not started:
+            self._touch_failed(RuntimeError("Touch forwarding stopped before dispatch."))
+
+    def _touch_done(self, phase: str, result: Any) -> None:
+        self._touch_sending = False
+        if isinstance(result, dict) and result.get("ok") is False:
+            self._touch_failed(RuntimeError("The touch action was not confirmed."))
+        elif phase == "up":
+            self._touch_outstanding = self._touch_release_requested = False
+            self._touch_pending.clear()
+            self.refresh_state()
+        else:
+            self._touch_pump()
+
+    def _touch_failed(self, _exc: BaseException) -> None:
+        self._touch_pending.clear()
+        self._touch_sending = self._touch_outstanding = self._touch_release_requested = False
+        self.touch.end_contact(emit=False)
+        self.win.cancel_service_inputs()
+        self.refresh_state()
 
     def _can(self, feature: str, what: str) -> bool:
         if self.win.supports(feature):

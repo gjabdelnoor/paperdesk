@@ -8,8 +8,8 @@ from unittest.mock import Mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QEvent, QSettings
-from PySide6.QtGui import QFocusEvent
+from PySide6.QtCore import QEvent, QPointF, QSettings, Qt
+from PySide6.QtGui import QFocusEvent, QGuiApplication, QImage, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QApplication
 
 from paperdesk.backend import SuiteService
@@ -110,6 +110,51 @@ class GatedInput:
     def disconnect(self):
         self.calls.append(("disconnect",))
         self.connected = False
+
+
+class PointerFixture(GatedInput):
+    def __init__(self, hold_down=False, fail_up=False):
+        super().__init__()
+        self.hold_down, self.fail_up = hold_down, fail_up
+        self.contact = False
+
+    def status(self):
+        result = super().status()
+        result["capabilities"].update({"touch": True, "direct-paste": True})
+        return result
+
+    def type_text(self, text):
+        self.calls.append(("type", text))
+        return {"ok": True}
+
+    def paste_image(self, path):
+        assert not QImage(path).isNull()
+        self.calls.append(("image",))
+        return {"ok": True}
+
+    def touch(self, phase, x, y):
+        assert 0 <= x <= 1 and 0 <= y <= 1
+        self.calls.append(("touch", phase, x, y))
+        if phase == "down":
+            self.contact = True
+            self.entered.set()
+            if self.hold_down:
+                assert self.release.wait(3)
+        elif phase == "up":
+            if self.fail_up:
+                raise UnknownMutation("Synthetic release receipt lost; no replay")
+            self.contact = False
+        return {"ok": True}
+
+    def cancel_current(self):
+        self.contact = False  # models EOF releasing the helper's kernel device
+        return super().cancel_current()
+
+
+def mouse_event(kind, x, y):
+    button = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseMove else Qt.MouseButton.LeftButton
+    buttons = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseButtonRelease else Qt.MouseButton.LeftButton
+    return QMouseEvent(kind, QPointF(x, y), QPointF(x, y), button, buttons, Qt.KeyboardModifier.NoModifier)
 
 
 def test_real_demo_setup_reconnect_never_uses_pairing_api(app, make_window, tmp_path):
@@ -254,3 +299,112 @@ def test_shutdown_cleans_owned_service_even_with_disconnected_display(app, make_
     assert window.shutdown()
     assert not service.art_running and not service.connected
     assert service.calls[-2:] == [("stop_art",), ("disconnect",)]
+
+
+@pytest.mark.parametrize("modifiers", [Qt.KeyboardModifier.ControlModifier,
+                                       Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
+                                       Qt.KeyboardModifier.MetaModifier])
+def test_live_clipboard_shortcuts_type_host_text(app, make_window, modifiers):
+    service = PointerFixture()
+    window = make_window(service)
+    page = window.pages["type"]
+    QGuiApplication.clipboard().setText("Synthetic host clipboard")
+    page.live.start()
+    page.live.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_V, modifiers, "v"))
+    pump(app, lambda: not window.runner.busy)
+    assert ("type", "Synthetic host clipboard") in service.calls
+    assert not any(call[0] == "key" for call in service.calls), "Desktop paste must not send the tablet's paste shortcut"
+    QGuiApplication.clipboard().clear()
+
+
+def test_live_clipboard_image_uses_native_paste_and_ctrl_p_uses_tablet_clipboard(app, make_window):
+    service = PointerFixture()
+    window = make_window(service)
+    page = window.pages["type"]
+    image = QImage(30, 40, QImage.Format.Format_ARGB32)
+    image.fill(0x804080C0)
+    QGuiApplication.clipboard().setImage(image)
+    page.live.start()
+    page.live.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier, "v"))
+    pump(app, lambda: not window.runner.busy)
+    assert ("image",) in service.calls
+    assert not any(call[0] in {"type", "key"} for call in service.calls)
+    page.live.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_P, Qt.KeyboardModifier.ControlModifier, "p"))
+    pump(app, lambda: not window.runner.busy)
+    assert ("key", "paste") in service.calls
+    QGuiApplication.clipboard().clear()
+
+
+def test_drag_coalesces_moves_and_releases_once_outside_surface(app, make_window):
+    service = PointerFixture(hold_down=True)
+    window = make_window(service)
+    page = window.pages["type"]
+    surface = page.touch
+    surface.mousePressEvent(mouse_event(QEvent.Type.MouseButtonPress, 20, 30))
+    assert service.entered.wait(2)
+    for index in range(1000):
+        surface.mouseMoveEvent(mouse_event(QEvent.Type.MouseMove, index % 230, index % 310))
+        assert len(page._touch_pending) <= 1
+    surface.mouseReleaseEvent(mouse_event(QEvent.Type.MouseButtonRelease, 500, -20))
+    assert len(page._touch_pending) <= 2
+    service.release.set()
+    pump(app, lambda: not window.runner.busy)
+    events = [call for call in service.calls if call[0] == "touch"]
+    assert [call[1] for call in events] == ["down", "move", "up"]
+    assert events[-1][2:] == (1.0, 0.0)
+    assert not service.contact and not page._touch_outstanding
+
+
+@pytest.mark.parametrize("trigger", ["focus", "capture", "escape", "stop", "disconnect", "close"])
+def test_contact_releases_on_every_lifecycle_boundary(app, make_window, trigger):
+    service = PointerFixture()
+    window = make_window(service)
+    page, surface = window.pages["type"], window.pages["type"].touch
+    surface.mousePressEvent(mouse_event(QEvent.Type.MouseButtonPress, 60, 80))
+    pump(app, lambda: not window.runner.busy)
+    assert service.contact
+    if trigger == "focus":
+        surface.focusOutEvent(QFocusEvent(QEvent.Type.FocusOut))
+    elif trigger == "capture":
+        QApplication.sendEvent(surface, QEvent(QEvent.Type.UngrabMouse))
+    elif trigger == "escape":
+        surface.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier))
+    elif trigger == "stop":
+        page.stop_forwarding()
+    elif trigger == "disconnect":
+        window.disconnect_tablet()
+    else:
+        window.close()
+    pump(app, lambda: not window.runner.busy)
+    assert not service.contact and not surface._contact
+    releases = [call for call in service.calls if call[:2] == ("touch", "up")]
+    assert len(releases) <= 1, "A release with uncertain delivery must not be replayed"
+
+
+def test_lost_release_receipt_closes_helper_without_replaying_up(app, make_window):
+    service = PointerFixture(fail_up=True)
+    window = make_window(service)
+    page = window.pages["type"]
+    page.tap(.4, .6)
+    pump(app, lambda: not window.runner.busy)
+    assert not service.contact
+    assert len([call for call in service.calls if call[:2] == ("touch", "up")]) == 1
+    assert ("cancel",) in service.calls and window.uncertain is not None
+
+
+def test_keyboard_touch_cursor_can_press_drag_and_release(app, make_window):
+    service = PointerFixture()
+    window = make_window(service)
+    surface = window.pages["type"].touch
+    def key(value):
+        surface.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, value, Qt.KeyboardModifier.NoModifier))
+        pump(app, lambda: not window.runner.busy)
+    key(Qt.Key.Key_Right)  # position cursor without sending an input contact
+    assert not any(call[0] == "touch" for call in service.calls)
+    key(Qt.Key.Key_Return)
+    assert service.contact
+    key(Qt.Key.Key_Down)
+    key(Qt.Key.Key_Return)
+    events = [call for call in service.calls if call[0] == "touch"]
+    assert [call[1] for call in events] == ["down", "move", "up"]
+    assert not service.contact

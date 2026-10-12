@@ -11,6 +11,7 @@ import importlib.util
 import importlib.metadata
 import json
 import re
+import hashlib
 
 
 OPENSSL_DYLIB = re.compile(r"^lib(ssl|crypto)\.(\d+(?:\.\d+)*)\.dylib$")
@@ -179,6 +180,77 @@ def sign_macos_bundle(bundle, report):
         report["signing"][key] = result
         if result.get("returncode") != 0:
             raise RuntimeError(f"macOS app {key} failed: {result.get('stderr') or result.get('error')}")
+    # Gatekeeper trust is distinct from signature integrity. Record the runner's
+    # actual policy and assessment, without changing policy or treating an
+    # ad-hoc app as Developer ID signed/notarized.
+    report["signing"]["gatekeeper"] = {
+        "status": command_diagnostic(["spctl", "--status"]),
+        "assessment": command_diagnostic(["spctl", "--assess", "--type", "execute", "--verbose=4", str(bundle)]),
+    }
+
+
+def copy_macos_openssl_licenses(destination, report):
+    """Copy original licensing from the selected library's installation prefix."""
+    selected = report["selected_binaries"]
+    if not selected:
+        report["openssl_licensing"] = {"mode": "static-cryptography-wheel", "copied_by": "Python distribution license helper"}
+        return
+    ssl_path = next(Path(path) for name, path in selected.items() if name.startswith("libssl."))
+    prefix = ssl_path.resolve().parent.parent
+    version_info = report["python_openssl"] if report["selection"].startswith("python-") else report["cryptography_openssl"]
+    match = re.search(r"\bOpenSSL (\d+\.\d+\.\d+)\b", version_info["version"])
+    if not match:
+        raise RuntimeError("The selected OpenSSL version cannot be identified for license provenance")
+    version = match.group(1)
+    candidates = list(prefix.iterdir())
+    documentation = prefix / "share/doc"
+    if documentation.is_dir():
+        candidates += list(documentation.rglob("*"))
+    for provider_path in report.get("selected_provider_directories", []):
+        provider = Path(provider_path).resolve()
+        if provider.is_dir() and provider.is_relative_to(prefix):
+            candidates += list(provider.rglob("*"))
+    material = sorted({path for path in candidates if path.is_file()
+                       and path.name.upper().startswith(("LICENSE", "COPYING", "NOTICE"))
+                       and path.resolve().is_relative_to(prefix)})
+    licenses = [path for path in material if path.name.upper().startswith(("LICENSE", "COPYING"))
+                and all(marker in path.read_bytes() for marker in
+                        (b"Apache License", b"Version 2.0", b"END OF TERMS AND CONDITIONS"))]
+    if not licenses:
+        raise RuntimeError(f"The complete OpenSSL Apache-2.0 license is missing from selected package prefix {prefix}")
+    # Preserve all package license/NOTICE files verbatim, including notices for
+    # providers installed alongside this exact pair. No network fallback can
+    # accidentally substitute the license or source URL of a newer Homebrew keg.
+    destination.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for path in material:
+        relative = path.relative_to(prefix)
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        copied.append({"source": str(path), "file": relative.as_posix(),
+                       "sha256": hashlib.sha256(target.read_bytes()).hexdigest()})
+    origin = {"project": "OpenSSL", "version": version, "license": "Apache-2.0",
+              "homepage": "https://openssl-library.org/", "installed_prefix": str(prefix),
+              "source_url": f"https://github.com/openssl/openssl/releases/download/openssl-{version}/openssl-{version}.tar.gz",
+              "license_url": f"https://github.com/openssl/openssl/blob/openssl-{version}/LICENSE.txt",
+              "files": copied}
+    (destination / "ORIGIN.json").write_text(json.dumps(origin, indent=2) + "\n", encoding="utf-8")
+    report["openssl_licensing"] = origin
+
+
+def copy_public_docs(root, destination):
+    """Include tracked docs and their images, excluding unrelated local files."""
+    result = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", "docs"],
+                            text=True, capture_output=True, check=True, timeout=30)
+    docs = (root / "docs").resolve()
+    for name in sorted(filter(None, result.stdout.split("\0"))):
+        source = root / name
+        if not source.is_file() or not source.resolve().is_relative_to(docs):
+            raise RuntimeError(f"Tracked public documentation is missing or escapes docs/: {name}")
+        target = destination / source.relative_to(root / "docs")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
 
 def copy_dependency_licenses(destination: Path):
@@ -230,9 +302,11 @@ def main():
     for filename in ("LICENSE", "THIRD_PARTY_NOTICES.md", "README.md"):
         target = bundle / ("Contents/Resources" if sys.platform == "darwin" else ".")
         shutil.copy2(root / filename, target / filename)
+    copy_public_docs(root, bundle / ("Contents/Resources/docs" if sys.platform == "darwin" else "docs"))
     if sys.platform == "darwin":
         try:
             inspect_macos_bundle(bundle, macos_report)
+            copy_macos_openssl_licenses(bundle / "Contents/Resources/licenses/OpenSSL", macos_report)
             sign_macos_bundle(bundle, macos_report)
         finally:
             diagnostic_path.write_text(json.dumps(macos_report, indent=2) + "\n", encoding="utf-8")

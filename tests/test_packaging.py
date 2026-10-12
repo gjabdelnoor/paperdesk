@@ -2,6 +2,7 @@
 """Packaging regression checks use generated files and fake native commands."""
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -152,7 +153,9 @@ def test_top_level_resigning_preserves_inner_signatures_and_verifies_strictly(tm
     report = {"signing": {"identity": "ad-hoc", "notarized": False}}
     build.sign_macos_bundle(bundle, report)
     assert commands == [["codesign", "--force", "--sign", "-", str(bundle)],
-                        ["codesign", "--verify", "--deep", "--strict", str(bundle)]]
+                        ["codesign", "--verify", "--deep", "--strict", str(bundle)],
+                        ["spctl", "--status"],
+                        ["spctl", "--assess", "--type", "execute", "--verbose=4", str(bundle)]]
     assert report["signing"]["verify"]["returncode"] == 0 and not report["signing"]["notarized"]
 
 
@@ -167,3 +170,97 @@ def test_sign_or_verification_failure_stops_packaging(tmp_path, monkeypatch, fai
     with pytest.raises(RuntimeError, match="generated failure"):
         build.sign_macos_bundle(tmp_path / "PaperDesk.app", {"signing": {}})
     assert len(calls) == failed_command + 1
+
+
+def licensing_report(libraries, version="3.6.3"):
+    return {"selected_binaries": {name: str(path) for name, path in libraries.items()},
+            "selection": "cryptography-newer-compatible-pair",
+            "cryptography_openssl": {"version": f"OpenSSL {version} generated fixture"}}
+
+
+def test_selected_openssl_package_licenses_notices_and_origin_are_copied_verbatim(tmp_path):
+    cellar = tmp_path / "Cellar/openssl@3/3.6.3"
+    libraries = pair(cellar / "lib")
+    license_bytes = b"Apache License\nVersion 2.0\nGenerated full-file copy fixture\nEND OF TERMS AND CONDITIONS\n"
+    (cellar / "LICENSE.txt").write_bytes(license_bytes)
+    (cellar / "NOTICE").write_bytes(b"Generated OpenSSL attribution fixture\n")
+    opt = tmp_path / "opt/openssl@3"
+    opt.parent.mkdir()
+    opt.symlink_to(cellar, target_is_directory=True)
+    selected = {name: opt / "lib" / name for name in libraries}
+    report = licensing_report(selected)
+    destination = tmp_path / "app/Contents/Resources/licenses/OpenSSL"
+    build.copy_macos_openssl_licenses(destination, report)
+    assert (destination / "LICENSE.txt").read_bytes() == license_bytes
+    assert (destination / "NOTICE").read_bytes() == (cellar / "NOTICE").read_bytes()
+    origin = report["openssl_licensing"]
+    assert origin["version"] == "3.6.3" and origin["installed_prefix"] == str(cellar)
+    assert origin["source_url"].endswith("/openssl-3.6.3/openssl-3.6.3.tar.gz")
+    assert {entry["file"] for entry in origin["files"]} == {"LICENSE.txt", "NOTICE"}
+    assert all(len(entry["sha256"]) == 64 for entry in origin["files"])
+    assert (destination / "ORIGIN.json").is_file()
+
+
+def test_missing_or_incomplete_openssl_license_refuses_packaging(tmp_path):
+    libraries = pair(tmp_path / "package/lib")
+    (tmp_path / "package/LICENSE.txt").write_bytes(b"Generated incomplete license fixture")
+    with pytest.raises(RuntimeError, match="complete OpenSSL"):
+        build.copy_macos_openssl_licenses(tmp_path / "app/licenses", licensing_report(libraries))
+
+
+def test_python_newer_pair_uses_its_version_for_license_origin(tmp_path):
+    libraries = pair(tmp_path / "package/lib")
+    (tmp_path / "package/LICENSE.txt").write_bytes(b"Apache License\nVersion 2.0\nEND OF TERMS AND CONDITIONS\n")
+    report = licensing_report(libraries, "3.4.0")
+    report.update(selection="python-newer-compatible-pair", python_openssl={"version": "OpenSSL 3.6.3 generated fixture"})
+    build.copy_macos_openssl_licenses(tmp_path / "app/licenses", report)
+    assert report["openssl_licensing"]["version"] == "3.6.3"
+
+
+def test_static_cryptography_does_not_copy_unrelated_homebrew_licenses(tmp_path):
+    report = {"selected_binaries": {}}
+    destination = tmp_path / "app/licenses/OpenSSL"
+    build.copy_macos_openssl_licenses(destination, report)
+    assert not destination.exists()
+    assert report["openssl_licensing"]["mode"] == "static-cryptography-wheel"
+
+
+def test_gatekeeper_rejection_is_recorded_without_claiming_developer_id_trust(tmp_path, monkeypatch):
+    def run(argv):
+        return {"returncode": 3 if "--assess" in argv else 0,
+                "stderr": "generated ad-hoc rejection" if "--assess" in argv else ""}
+    monkeypatch.setattr(build, "command_diagnostic", run)
+    report = {"signing": {"identity": "ad-hoc", "developer_id": False, "notarized": False}}
+    build.sign_macos_bundle(tmp_path / "app", report)
+    assert report["signing"]["verify"]["returncode"] == 0
+    assert report["signing"]["gatekeeper"]["assessment"]["returncode"] == 3
+    assert not report["signing"]["developer_id"] and not report["signing"]["notarized"]
+
+
+def test_public_docs_copy_includes_tracked_images_and_excludes_untracked_files(tmp_path, monkeypatch):
+    root, destination = tmp_path / "repository", tmp_path / "bundle/docs"
+    (root / "docs/images").mkdir(parents=True)
+    (root / "docs/guide.md").write_text("Generated public guide fixture")
+    (root / "docs/images/home.png").write_bytes(b"Generated image fixture")
+    (root / "docs/untracked-local.txt").write_text("Generated excluded local fixture")
+    commands = []
+    def run(argv, **kwargs):
+        commands.append(argv)
+        return SimpleNamespace(stdout="docs/guide.md\0docs/images/home.png\0")
+    monkeypatch.setattr(build.subprocess, "run", run)
+    build.copy_public_docs(root, destination)
+    assert commands == [["git", "-C", str(root), "ls-files", "-z", "--", "docs"]]
+    assert (destination / "guide.md").read_bytes() == (root / "docs/guide.md").read_bytes()
+    assert (destination / "images/home.png").read_bytes() == (root / "docs/images/home.png").read_bytes()
+    assert not (destination / "untracked-local.txt").exists()
+
+
+def test_tracked_document_symlink_cannot_copy_an_unrelated_file(tmp_path, monkeypatch):
+    root = tmp_path / "repository"
+    (root / "docs").mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"Generated outside-root fixture")
+    (root / "docs/escape.md").symlink_to(outside)
+    monkeypatch.setattr(build.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout="docs/escape.md\0"))
+    with pytest.raises(RuntimeError, match="escapes docs"):
+        build.copy_public_docs(root, tmp_path / "bundle/docs")

@@ -6,8 +6,8 @@ from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import (QCheckBox, QGridLayout, QHBoxLayout, QLineEdit, QScrollArea, QSpinBox,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLineEdit, QScrollArea,
+                               QSpinBox, QVBoxLayout, QWidget)
 
 from ..models import DeviceConfig
 from . import theme
@@ -98,6 +98,12 @@ class ConnectPanel(QWidget):
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(8)
         grid.setColumnStretch(1, 1)
+        self.transport = QComboBox()
+        self.transport.setAccessibleName("Connection type")
+        self.transport.addItem("USB / network SSH", "ssh")
+        self.transport.addItem("Tailscale SSH", "tailscale")
+        self.transport.setCurrentIndex(max(self.transport.findData(saved.transport_mode), 0))
+        self.transport.currentIndexChanged.connect(self.refresh_state)
         self.host = QLineEdit(saved.host)
         self.host.setAccessibleName("Tablet address")
         self.port = QSpinBox()
@@ -117,7 +123,7 @@ class ConnectPanel(QWidget):
         self.key_path = QLineEdit(saved.key_path)
         self.key_path.setAccessibleName("Key file")
         self.key_path.setPlaceholderText("Optional: a private key file instead of the password")
-        choose_key = button("Choose…", name="Choose key file")
+        choose_key = self.choose_key = button("Choose…", name="Choose key file")
         choose_key.clicked.connect(self._choose_key)
         host_row, pass_row, key_row = QHBoxLayout(), QHBoxLayout(), QHBoxLayout()
         for line in (host_row, pass_row, key_row):
@@ -129,18 +135,21 @@ class ConnectPanel(QWidget):
         pass_row.addWidget(self.show_password)
         key_row.addWidget(self.key_path, 1)
         key_row.addWidget(choose_key)
-        for row, (text, layout) in enumerate((("Address", host_row), ("User name", None),
-                                              ("Password", pass_row), ("Key file", key_row))):
+        for row, (text, field) in enumerate((("Connect by", self.transport), ("Address", host_row),
+                                             ("User name", self.username), ("Password", pass_row),
+                                             ("Key file", key_row))):
             grid.addWidget(label(text, None, wrap=False), row, 0)
-            if layout is None:
-                grid.addWidget(self.username, row, 1)
+            if isinstance(field, QWidget):
+                grid.addWidget(field, row, 1)
             else:
-                grid.addLayout(layout, row, 1)
+                grid.addLayout(field, row, 1)
         self.form_card.body.addLayout(grid)
+        self.transport_note = self.form_card.add(label("", "muted"))
+        self.transport_note.setAccessibleName("About this connection type")
         self.form_card.add(label(
             "The password stays in this window's memory for this session only. It is never written to "
-            "disk, never logged, and you never need a terminal. The address, user name and key file "
-            "location are remembered.", "caption"))
+            "disk, never logged, and you never need a terminal. The connection type, address, user "
+            "name and key file location are remembered.", "caption"))
         self.check_button = button("Check tablet identity", "primary",
                                    "Read the tablet's identity; nothing is trusted or changed yet")
         self.disconnect_button = button("Disconnect")
@@ -160,13 +169,8 @@ class ConnectPanel(QWidget):
         self.fingerprint.setFont(theme.mono_font())
         self.fingerprint.setAccessibleName("Host key fingerprint")
         self.trust_card.add(self.fingerprint)
-        self.trust_card.add(label(
-            "PaperDesk has not sent your password and has changed nothing. Trust this identity only if "
-            "the tablet is plugged straight into this computer by its USB cable, or if the fingerprint "
-            "matches one you recorded earlier. Once trusted it is remembered, and PaperDesk refuses to "
-            "connect if this address ever presents a different one.", "muted"))
-        self.trust_check = QCheckBox("The tablet is plugged directly into this computer, or I have "
-                                     "compared the fingerprint")
+        self.trust_advice = self.trust_card.add(label("", "muted"))
+        self.trust_check = QCheckBox("")
         self.trust_check.toggled.connect(self.refresh_state)
         self.trust_card.add(self.trust_check)
         self.trust_button = button("Trust this tablet and connect", "primary")
@@ -175,7 +179,25 @@ class ConnectPanel(QWidget):
         self.cancel_button.clicked.connect(win.cancel_pairing)
         self.trust_card.add(flow(self.trust_button, self.cancel_button))
         column.addWidget(self.trust_card)
+
+        self.before_card = Card("Before a tablet's first connection")
+        self.before_card.add(label(
+            "<b>Switch on the USB web interface.</b> On the tablet open Settings › Storage and turn on "
+            "USB web interface. Uploading and exporting documents go through it, so they are refused "
+            "until it is on. PaperDesk does not switch it on for you.", None))
+        self.before_card.add(label(
+            "<b>reMarkable 1 and reMarkable 2 have no developer-mode switch.</b> That switch exists "
+            "only on the Paper Pro family, where turning it on erases the tablet. On a reMarkable 1 "
+            "or 2 there is nothing to switch on first: the password is already listed under "
+            "Settings › Help › Copyrights and licenses.", None))
+        self.before_card.add(label(
+            "reMarkable's own description of developer mode: "
+            "https://developer.remarkable.com/documentation/developer-mode", "caption", selectable=True))
+        column.addWidget(self.before_card)
         column.addStretch(1)
+
+    def tailscale(self) -> bool:
+        return self.transport.currentData() == "tailscale"
 
     def _reveal_trust(self) -> None:
         parent = self.parentWidget()
@@ -191,22 +213,29 @@ class ConnectPanel(QWidget):
             self.key_path.setText(path)
 
     def config(self) -> DeviceConfig:
+        # Tailscale mode never hands over the tablet password; the key file location is only kept
+        # so that switching back to SSH finds it again.
         return DeviceConfig(host=self.host.text().strip(), port=self.port.value(),
                             username=self.username.text().strip() or "root",
-                            key_path=self.key_path.text().strip(), password=self.password.text())
+                            key_path=self.key_path.text().strip(),
+                            password="" if self.tailscale() else self.password.text(),
+                            transport_mode="tailscale" if self.tailscale() else "ssh")
 
     def ready(self) -> bool:
-        return bool(self.host.text().strip()) and bool(self.password.text() or self.key_path.text().strip())
+        return bool(self.host.text().strip()) and (
+            self.tailscale() or bool(self.password.text() or self.key_path.text().strip()))
 
     def focus_first_missing(self) -> None:
-        (self.host if not self.host.text().strip() else self.password).setFocus()
+        (self.host if self.tailscale() or not self.host.text().strip() else self.password).setFocus()
 
     def submit(self) -> None:
         if self.win.simulated:
             self.win.connect_simulator(pair=True)
         elif not self.ready():
             self.focus_first_missing()
-            self.win.notify("info", "Enter the tablet's password or choose a key file, then check its identity.")
+            self.win.notify("info", "Enter the tablet's Tailscale name or address, then check its identity."
+                            if self.tailscale() else
+                            "Enter the tablet's password or choose a key file, then check its identity.")
         else:
             self.trust_check.setChecked(False)
             self.win.connect_with(self.config())
@@ -218,9 +247,37 @@ class ConnectPanel(QWidget):
     def refresh_state(self, *_args) -> None:
         win, mode = self.win, self.win.connection_mode
         sim, connected, busy = win.simulated, win.connected, mode == "connecting"
-        for widget in (self.host, self.port, self.username, self.password, self.show_password,
-                       self.key_path):
-            widget.setEnabled(not sim and not connected and not busy and mode != "unavailable")
+        editable = not sim and not connected and not busy and mode != "unavailable"
+        tailscale = self.tailscale()
+        for widget in (self.transport, self.host, self.port, self.username):
+            widget.setEnabled(editable)
+        for widget in (self.password, self.show_password, self.key_path, self.choose_key):
+            widget.setEnabled(editable and not tailscale)
+        self.password.setPlaceholderText("Not used with Tailscale SSH" if tailscale
+                                         else "Shown on the tablet; see step 1")
+        self.transport_note.setText(
+            "Tailscale SSH uses the Tailscale client already installed and signed in on this computer, "
+            "and your tailnet's own permission for this tablet. The tablet's password and key file "
+            "are not used. PaperDesk never installs or starts Tailscale on the tablet, never opens a "
+            "sign-in page in a browser, and never switches connection type by itself. Type the "
+            "tablet's Tailscale name or address above yourself; it is not looked up for you."
+            if tailscale else "")
+        self.transport_note.setVisible(tailscale)
+        self.before_card.setVisible(not sim and not connected)
+        self.trust_advice.setText(
+            "PaperDesk has sent no password and has changed nothing. Over Tailscale the tablet is not "
+            "identified by a cable, so trust this identity only if the fingerprint matches one you "
+            "recorded from this tablet earlier. Once trusted it is remembered, and PaperDesk refuses "
+            "to connect if this address ever presents a different one."
+            if tailscale else
+            "PaperDesk has not sent your password and has changed nothing. Trust this identity only if "
+            "the tablet is plugged straight into this computer by its USB cable, or if the fingerprint "
+            "matches one you recorded earlier. Once trusted it is remembered, and PaperDesk refuses to "
+            "connect if this address ever presents a different one.")
+        self.trust_check.setText("I have compared this fingerprint with one I recorded from this tablet"
+                                 if tailscale else
+                                 "The tablet is plugged directly into this computer, or I have "
+                                 "compared the fingerprint")
         self.check_button.setVisible(not connected)
         self.check_button.setText("Start simulated tablet" if sim else "Check tablet identity")
         self.check_button.setEnabled(not busy and mode != "unavailable" and (sim or self.ready()))
@@ -240,7 +297,8 @@ class ConnectPanel(QWidget):
         elif sim:
             text, role = "The simulator needs no address or password. Start it to continue.", "muted"
         elif not self.ready():
-            text, role = "Enter the password from the tablet, or choose a key file.", "muted"
+            text, role = ("Enter the tablet's Tailscale name or address." if tailscale else
+                          "Enter the password from the tablet, or choose a key file."), "muted"
         else:
             text, role = "Ready. The first step only reads the tablet's identity.", "muted"
         self.state_label.setText(text)
@@ -305,11 +363,12 @@ class SetupPage(Page):
     # -- sections ------------------------------------------------------
     def _build_developer(self) -> QWidget:
         holder, column = self._column()
-        card = Card("Your tablet should already be in developer mode")
+        card = Card("Prepare SSH access on your tablet")
         card.add(label(
-            "PaperDesk expects developer mode to be switched on already. It never turns developer mode "
-            "on and never resets a tablet: switching it on erases the tablet, and that choice is made "
-            "on the tablet itself, by you. If yours is freshly in developer mode, four steps remain.",
+            "Paper Pro should already be in developer mode. Enabling it erases the tablet; that choice "
+            "is made on the tablet itself after backing up. PaperDesk never enables it or resets a "
+            "tablet. reMarkable 1 and 2 have no developer-mode switch and provide their SSH details "
+            "in Copyrights and licenses. When SSH access is ready, four steps remain.",
             "muted"))
         steps = (
             ("Plug in and wake the tablet",

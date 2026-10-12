@@ -29,6 +29,18 @@ class UnknownInstallationOutcome(InstallerError):
     no_retry = True
 
 
+def classify_model(observed: str, architecture: str) -> str:
+    normalized = observed.lower()
+    if "move" in normalized: model = "unsupported"
+    elif "paper pro" in normalized or "ferrari" in normalized: model = "paper-pro"
+    elif "remarkable 2" in normalized or "rm2" == normalized: model = "rm2"
+    elif "remarkable 1" in normalized or normalized == "remarkable": model = "rm1"
+    else: model = "unsupported"
+    if model == "paper-pro" and architecture != "aarch64": model = "unsupported"
+    if model in {"rm1", "rm2"} and architecture not in {"armv7l", "armv6l", "arm"}: model = "unsupported"
+    return model
+
+
 def _script(action: str, details: dict, body: str) -> str:
     return "#!/bin/sh\n# paperdesk-operation: " + json.dumps({"action": action, **details}, separators=(",", ":")) + "\nset -eu\n" + body + "\n"
 
@@ -83,14 +95,8 @@ class DeviceInstaller:
         raw = self.transport.run(PROBE_SCRIPT)
         values = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
         observed = values.get("model", "")
-        normalized = observed.lower()
-        if "paper pro" in normalized or "ferrari" in normalized: model = "paper-pro"
-        elif "remarkable 2" in normalized or "rm2" == normalized: model = "rm2"
-        elif "remarkable 1" in normalized or normalized == "remarkable": model = "rm1"
-        else: model = "unsupported"
         arch = values.get("architecture", "")
-        if model == "paper-pro" and arch != "aarch64": model = "unsupported"
-        if model in {"rm1", "rm2"} and arch not in {"armv7l", "armv6l", "arm"}: model = "unsupported"
+        model = classify_model(observed, arch)
         return {"model": model, "observed_model": observed, "architecture": arch, "firmware": values.get("firmware", ""),
                 "xochitl_sha256": values.get("xochitl_sha256", ""), "uinput": values.get("uinput") == "1",
                 "foreign_loader": values.get("foreign_loader") == "1", "installed": values.get("installed") == "1",

@@ -143,10 +143,10 @@ def test_typed_install_timeout_is_unknown_and_read_timeout_is_normal(tmp_path,mo
     transport._session = Mock(return_value=session)
     monkeypatch.setattr("paperdesk.transport.time.sleep",lambda _:None)
     with pytest.raises(UnknownMutation) as failed:
-        transport.run('# paperdesk-operation: {"action":"activate"}\nchange',timeout=0)
+        transport.run('# paperdesk-operation: {"action":"activate"}\nchange',timeout=.01)
     assert failed.value.no_retry and failed.value.outcome_unknown
     with pytest.raises(DeviceError,match="read-only") as read:
-        transport.run('# paperdesk-operation: {"action":"probe"}\nread',timeout=0)
+        transport.run('# paperdesk-operation: {"action":"probe"}\nread',timeout=.01)
     assert not isinstance(read.value,UnknownMutation)
 
 

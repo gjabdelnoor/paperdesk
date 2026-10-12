@@ -81,7 +81,6 @@ def main(argv=None) -> int:
                     print(json.dumps(diagnostic), file=sys.stderr)
             finally:
                 window.close()
-                app.quit()
         QTimer.singleShot(1600, finish)
     result = app.exec()
     return 1 if failures else result

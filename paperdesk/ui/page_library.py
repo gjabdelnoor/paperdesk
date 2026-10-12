@@ -1,4 +1,4 @@
-"""Library: documents on the tablet, upload, download, PDF export and folder sync."""
+"""Library: documents on the tablet, upload, download, PDF export, copy pass, archive status."""
 from __future__ import annotations
 
 import re
@@ -13,8 +13,75 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QHBoxLayout, QLineE
 from .services import describe_error
 from .widgets import Card, Page, button, flow, label, plain, pretty_key, set_role
 
-UPLOAD_FILTER = "Documents (*.pdf *.epub);;All files (*)"
+UPLOAD_FILTER = "Documents (*.pdf *.epub *.rmdoc);;All files (*)"
 _EXTENSIONS = {"pdf": ".pdf", "epub": ".epub"}
+_COPY_ABOUT = ("One pass, only when you press the button. PDF, EPUB and RMDOC files in the chosen folder "
+               "are imported to the tablet's top level; then every tablet document is saved as a complete "
+               "PDF in a new dated folder inside device-copies. Nothing is deleted on either side. It "
+               "does not keep the two in step and is separate from any archive timer.")
+_ARCHIVE_ABOUT = ("Reads the status file of an archive timer already set up on this computer, if there is "
+                  "one. PaperDesk never starts, stops or configures that timer, and looks only when you "
+                  "press the button.")
+
+
+def is_folder(doc: Any) -> bool:
+    return isinstance(doc, dict) and str(doc.get("type") or "").lower() == "folder"
+
+
+def upload_choices(documents: list[dict]) -> list[tuple[str, str]]:
+    """(label, value) for each tablet folder an upload can go into.
+
+    Real folder rows are used as they are, empty or not, with the folder's id as the value and
+    a short id beside names that occur twice.  Only a service that reports no folder rows at
+    all falls back to the folder names its documents mention.
+    """
+    rows = [doc for doc in documents if is_folder(doc) and doc.get("id")]
+    if not rows:
+        names = sorted({str(doc["folder"]) for doc in documents if doc.get("folder")}, key=str.casefold)
+        return [(name, name) for name in names]
+    names = [str(doc.get("name") or "") for doc in rows]
+    choices = []
+    for doc, name in zip(rows, names):
+        ident = str(doc["id"])
+        shown = name or "Unnamed folder"
+        choices.append((f"{shown} ({ident[:8]})" if names.count(name) > 1 else shown, ident))
+    return sorted(choices, key=lambda choice: (choice[0].casefold(), choice[1]))
+
+
+def size(count: float) -> str:
+    value = float(count)
+    for unit in ("bytes", "KB", "MB"):
+        if value < 1024:
+            return f"{value:.0f} {unit}" if unit == "bytes" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def archive_text(info: Any) -> tuple[str, str]:
+    """(sentence, role) for what archive_sync_status() reported."""
+    if not isinstance(info, dict):
+        return "The archive status could not be read.", "warn"
+    message = str(info.get("message") or "").strip()
+    if info.get("invalid"):
+        return " ".join(filter(None, ["Unreadable.", message])), "warn"
+    if not info.get("available"):
+        return " ".join(filter(None, ["Not available.", message])), "muted"
+    stale = bool(info.get("stale"))
+    active = info.get("active") is True and not stale
+    large = info.get("large") is True and active
+    parts = ["Stale." if stale else "Active, large transfer." if large else "Active." if active else "Idle.",
+             message]
+    if large and "usb" not in message.lower():
+        parts.append("Plugging the tablet in over USB-C speeds it up.")
+    done, total = info.get("bytes_done") or 0, info.get("bytes_total") or 0
+    if not stale and isinstance(done, (int, float)) and isinstance(total, (int, float)):
+        if total > 0:
+            parts.append(f"{size(done)} of {size(total)} ({min(100, round(100 * done / total))}%).")
+        elif done > 0:
+            parts.append(f"{size(done)} so far.")
+    if info.get("updated_at"):
+        parts.append(f"Status written {when(info['updated_at'])}.")
+    return " ".join(filter(None, parts)), "warn" if stale else "ok" if active else "muted"
 
 
 def when(value: Any) -> str:
@@ -39,7 +106,7 @@ class LibraryPage(Page):
                          "files; nothing on this computer is overwritten.")
         card = Card("On the tablet")
         self.reload_button = button("Reload list", None, "Read the document list again")
-        self.upload_button = button("Upload…", "primary", "Send PDF or EPUB files to the tablet (Ctrl+U)")
+        self.upload_button = button("Upload…", "primary", "Send PDF, EPUB or RMDOC files to the tablet (Ctrl+U)")
         self.download_button = button("Download…", None, "Save the selected document here (Ctrl+D)")
         self.reload_button.clicked.connect(win.reload_documents)
         self.upload_button.clicked.connect(self.upload)
@@ -58,6 +125,8 @@ class LibraryPage(Page):
         self.folder_combo = QComboBox()
         self.folder_combo.setAccessibleName("Tablet folder for uploads")
         self.folder_combo.setMinimumWidth(150)
+        self.folder_combo.currentIndexChanged.connect(self._folder_picked)
+        self._folder_chosen = self._filling = False
         row.addWidget(self.folder_combo, 1)
         card.body.addLayout(row)
 
@@ -89,16 +158,14 @@ class LibraryPage(Page):
         current.body.addLayout(line)
         self.col.addWidget(current)
 
-        sync = Card("Local sync",
-                    "Keep a folder on this computer in step with the tablet. PaperDesk reports exactly "
-                    "what the tablet service says it changed.")
+        sync = Card("Copy pass", _COPY_ABOUT)
         line = QHBoxLayout()
         self.sync_edit = QLineEdit(str(win.settings.value("library/sync_folder", "") or ""))
         self.sync_edit.setReadOnly(True)
         self.sync_edit.setPlaceholderText("No folder chosen")
-        self.sync_edit.setAccessibleName("Sync folder")
+        self.sync_edit.setAccessibleName("Copy pass folder")
         self.sync_choose = button("Choose folder…")
-        self.sync_button = button("Sync now")
+        self.sync_button = button("Run copy pass")
         self.sync_choose.clicked.connect(self.choose_sync_folder)
         self.sync_button.clicked.connect(self.sync)
         line.addWidget(self.sync_edit, 1)
@@ -108,6 +175,19 @@ class LibraryPage(Page):
         self.sync_result = sync.add(label("", "caption"))
         self.col.addWidget(sync)
 
+        self.archive_card = Card("Existing archive sync", _ARCHIVE_ABOUT)
+        self.archive_button = button("Refresh status", None,
+                                     "Read the archive timer's status once; the timer is not touched")
+        self.archive_button.setAccessibleName("Refresh archive sync status")
+        self.archive_button.clicked.connect(self.refresh_archive)
+        self.archive_label = label("Not read yet.", "muted")
+        self.archive_label.setAccessibleName("Archive sync status")
+        line = QHBoxLayout()
+        line.addWidget(self.archive_label, 1)
+        line.addWidget(self.archive_button)
+        self.archive_card.body.addLayout(line)
+        self.col.addWidget(self.archive_card)
+
         win.documents_changed.connect(self._populate)
         self._populate()
 
@@ -116,16 +196,13 @@ class LibraryPage(Page):
         selected = self.selected_id()
         self.table.setSortingEnabled(False)
         self.table.clear()
-        folders = set()
         for doc in self.win.documents:
             item = QTreeWidgetItem([plain(doc.get("name")), plain(doc.get("type")),
-                                    plain(doc.get("pages")), when(doc.get("modified")),
-                                    plain(doc.get("folder"))])
+                                    "" if is_folder(doc) else plain(doc.get("pages")),
+                                    when(doc.get("modified")), plain(doc.get("folder"))])
             item.setData(0, Qt.ItemDataRole.UserRole, doc)
             item.setTextAlignment(2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.table.addTopLevelItem(item)
-            if doc.get("folder"):
-                folders.add(str(doc["folder"]))
             if selected and doc.get("id") == selected:
                 item.setSelected(True)
         self.table.setSortingEnabled(True)
@@ -133,12 +210,19 @@ class LibraryPage(Page):
             self.table.resizeColumnToContents(column)
         self.table.setColumnWidth(0, min(max(self.table.columnWidth(0) + 16, 200), 380))
         chosen = self.folder_combo.currentData()
+        self._filling = True
         self.folder_combo.clear()
         self.folder_combo.addItem("Top level", "")
-        for folder in sorted(folders):
-            self.folder_combo.addItem(folder, folder)
-        index = self.folder_combo.findData(chosen)
+        for text, value in upload_choices(self.win.documents):
+            self.folder_combo.addItem(text, value)
+        index = self.folder_combo.findData(chosen) if self._folder_chosen else -1
+        if index < 0:
+            # Nothing was picked, or the picked folder is gone: a single real Inbox is the default.
+            self._folder_chosen = False
+            inboxes = [doc for doc in self.win.documents if is_folder(doc) and doc.get("name") == "Inbox"]
+            index = self.folder_combo.findData(str(inboxes[0].get("id"))) if len(inboxes) == 1 else 0
         self.folder_combo.setCurrentIndex(max(index, 0))
+        self._filling = False
         self._apply_filter()
         self.refresh_state()
 
@@ -151,15 +235,25 @@ class LibraryPage(Page):
             item.setHidden(not match)
             shown += match
         total = self.table.topLevelItemCount()
+        folders = sum(1 for doc in self.win.documents if is_folder(doc))
+        documents = total - folders
         if not self.win.connected:
             text = "Connect to a tablet to see its documents."
         elif total == 0:
             text = "The tablet reported no documents."
         elif shown == total:
-            text = f"{total} document" + ("" if total == 1 else "s")
+            text = f"{documents} document" + ("" if documents == 1 else "s")
+            if folders:
+                text += f" and {folders} folder" + ("" if folders == 1 else "s")
         else:
-            text = f"{shown} of {total} documents shown"
+            text = f"{shown} of {total} " + ("rows" if folders else "documents") + " shown"
+        if is_folder(self.selected()):
+            text += ". A folder cannot be downloaded; choose it under “Upload into” to send files there."
         self.count_label.setText(text)
+
+    def _folder_picked(self, _index: int) -> None:
+        if not self._filling:
+            self._folder_chosen = True
 
     def selected(self) -> dict | None:
         items = self.table.selectedItems()
@@ -183,7 +277,9 @@ class LibraryPage(Page):
             widget.setEnabled(connected)
         self.upload_button.setEnabled(self.win.allows("upload"))
         self.folder_combo.setEnabled(self.win.allows("upload"))
-        self.download_button.setEnabled(self.win.allows("download") and self.selected() is not None)
+        chosen = self.selected()
+        self.download_button.setEnabled(self.win.allows("download") and chosen is not None
+                                        and not is_folder(chosen))
         doc = self.win.status.get("active_document") if connected else None
         has_doc = isinstance(doc, dict) and bool(doc.get("name"))
         if has_doc:
@@ -195,8 +291,10 @@ class LibraryPage(Page):
         self.export_button.setEnabled(has_doc and self.win.allows("export"))
         self.sync_choose.setEnabled(True)
         self.sync_button.setEnabled(self.win.allows("sync") and bool(self.sync_edit.text()))
-        if not self.win.documents:
-            self._apply_filter()
+        self._apply_filter()
+        # The archive timer belongs to this computer, not to the pretend tablet: leave it alone there.
+        self.archive_card.setVisible(not self.win.simulated
+                                     and callable(getattr(self.win.service, "archive_sync_status", None)))
 
     # -- actions -------------------------------------------------------
     def upload(self) -> None:
@@ -215,6 +313,9 @@ class LibraryPage(Page):
         doc = self.selected()
         if doc is None:
             self.win.notify("info", "Select a document in the list first, then download it.")
+            return
+        if is_folder(doc):
+            self.win.notify("info", "A folder cannot be downloaded. Select a document inside it.")
             return
         name = safe_name(str(doc.get("name") or "document"))
         extension = _EXTENSIONS.get(str(doc.get("type") or "").lower(), ".pdf")
@@ -239,7 +340,7 @@ class LibraryPage(Page):
                          label=f"Export {name} as PDF")
 
     def choose_sync_folder(self) -> None:
-        folder = self.win.dialogs.directory("Choose the folder to sync")
+        folder = self.win.dialogs.directory("Choose the folder for the copy pass")
         if folder:
             self.sync_edit.setText(folder)
             self.win.settings.setValue("library/sync_folder", folder)
@@ -249,15 +350,15 @@ class LibraryPage(Page):
     def sync(self) -> None:
         folder = self.sync_edit.text()
         if not folder:
-            self.win.notify("info", "Choose a folder to sync first.")
+            self.win.notify("info", "Choose a folder for the copy pass first.")
             return
-        if self.win.run("sync", lambda s: s.sync(folder), label=f"Sync with {Path(folder).name}",
+        if self.win.run("sync", lambda s: s.sync(folder), label=f"Copy pass with {Path(folder).name}",
                         mutation=True, on_done=self._after_sync, on_error=self._sync_failed):
-            self.sync_result.setText("Syncing… the status line below shows when it finishes.")
+            self.sync_result.setText("Copy pass running… the status line below shows when it finishes.")
             set_role(self.sync_result, "caption")
 
     def _sync_failed(self, exc: BaseException) -> None:
-        self.sync_result.setText(f"The sync did not finish. {describe_error(exc)} Files already written "
+        self.sync_result.setText(f"The copy pass did not finish. {describe_error(exc)} Files already written "
                                  "stay where they are; nothing was retried.")
         set_role(self.sync_result, "error")
 
@@ -265,15 +366,17 @@ class LibraryPage(Page):
         if isinstance(result, dict):
             details = ", ".join(
                 f"{pretty_key(key).lower()}: {len(value) if isinstance(value, (list, dict)) else plain(value)}"
-                for key, value in result.items() if key not in ("ok", "message", "simulated"))
+                for key, value in result.items()
+                if key not in ("ok", "message", "simulated", "path", "paths", "mode"))
             paths = result.get("paths")
             names = [Path(str(item)).name for item in paths] if isinstance(paths, list) else []
             written = ("New files: " + ", ".join(names[:4])
                        + (f" and {len(names) - 4} more" if len(names) > 4 else "") + ".") if names else ""
+            where = f"Tablet copies are in {result['path']}." if result.get("path") else ""
             failed = result.get("ok") is False
             self.sync_result.setText(" ".join(filter(None, [
-                "Not completed." if failed else "Last sync:", str(result.get("message") or ""),
-                details + "." if details else "", written,
+                "Not completed." if failed else "Last copy pass:", str(result.get("message") or ""),
+                details + "." if details else "", written, where,
                 "Simulated copies, not real annotations." if result.get("simulated") else ""])))
             set_role(self.sync_result, "error" if failed else "caption")
         self._after_change(result)
@@ -281,6 +384,25 @@ class LibraryPage(Page):
     def _after_change(self, result: Any) -> None:
         if not (isinstance(result, dict) and result.get("ok") is False):
             self.win.reload_documents(quiet=True)
+
+    def refresh_archive(self) -> None:
+        if self.win.simulated:
+            return
+        if self.win.run("archive-status", lambda s: s.archive_sync_status(), needs_connection=False,
+                        label="Read the archive sync status", quiet=True,
+                        on_done=self._archive_read, on_error=self._archive_failed):
+            self.archive_label.setText("Reading…")
+            set_role(self.archive_label, "muted")
+
+    def _archive_read(self, result: Any) -> None:
+        text, role = archive_text(result)
+        self.archive_label.setText(text)
+        set_role(self.archive_label, role)
+
+    def _archive_failed(self, exc: BaseException) -> None:
+        self.archive_label.setText(f"The status could not be read. {describe_error(exc)} "
+                                   "The timer was not touched.")
+        set_role(self.archive_label, "error")
 
     def _ready(self, what: str) -> bool:
         if not self.win.connected:

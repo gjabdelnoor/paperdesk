@@ -16,9 +16,9 @@ from ..models import DeviceConfig
 
 FEATURES = [
     ("keyboard", "Keyboard forwarding",
-     "Type from this computer into the document open on the tablet."),
+     "Type into the tablet's focused text box. On the supported Paper Pro build, this also installs the experimental figure-ink helper."),
     ("touch", "Touch forwarding",
-     "Send taps from the touch surface on the Type page."),
+     "Send taps and drags from the touch surface on the Type page."),
     ("direct-paste", "Direct image paste",
      "Place a clipboard or file image on the page that is open."),
     ("art-display", "Art tablet mode",

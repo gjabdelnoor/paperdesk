@@ -18,7 +18,29 @@ ROTATIONS = [("auto", "Automatic"), ("portrait", "Portrait"), ("left", "Landscap
              ("right", "Landscape, turned right"), ("inverted", "Upside down")]
 # (row label, key in the art bridge's own capability report)
 CAPABILITIES = [("Pen position", "pointer"), ("Pen pressure", "pressure"), ("Pen tilt", "tilt"),
-                ("Touch gestures", "multitouch"), ("Canvas on the tablet", "art_display")]
+                ("Native multi-touch", "native_multitouch"), ("Gestures in Krita's canvas", "canvas_gestures"),
+                ("Canvas on the tablet", "art_display")]
+# The art bridge's own input methods, worded for the computer it reports running on.
+INPUT_MODES = ("auto", "pen", "mouse")
+MODE_TEXT = {
+    "": ("Automatic", "Pen", "Mouse pointer"),
+    "linux": ("Automatic — pen tablet", "Pen tablet", "Mouse pointer — not available on Linux"),
+    "windows": ("Automatic — Windows Ink when available", "Pen — Windows Ink",
+                "Mouse pointer — no pressure or tilt"),
+    "mac": ("Automatic — plain pointer", "Pen — experimental pressure", "Mouse pointer"),
+}
+MODE_HELP = {
+    ("linux", "auto"): "Linux receives the tablet as a pen tablet with pressure and tilt.",
+    ("linux", "pen"): "Linux receives the tablet as a pen tablet with pressure and tilt.",
+    ("windows", "auto"): "Uses Windows Ink for pressure, tilt and eraser when this computer offers it; "
+                         "otherwise the pen moves the pointer.",
+    ("windows", "pen"): "Asks for Windows Ink pen input.",
+    ("windows", "mouse"): "The pen only moves the pointer. Touch gestures then need the Krita canvas display.",
+    ("mac", "auto"): "On macOS the pen moves the pointer. Pressure and tilt are not sent.",
+    ("mac", "mouse"): "On macOS the pen moves the pointer. Pressure and tilt are not sent.",
+    ("mac", "pen"): "Experimental: pressure and tilt are sent as macOS tablet events. Whether an art "
+                    "application receives them has not been verified, so try it on a scratch canvas first.",
+}
 EXIT_HELP = ("Stop tablet mode here or from the bar at the top of any page. Disconnecting or closing "
              "PaperDesk stops it first, and your art application stays open. If the tablet still "
              "behaves as a drawing surface afterwards, restart the tablet: tablet mode uses only "
@@ -105,18 +127,32 @@ class ArtPage(Page):
         tune.setHorizontalSpacing(14)
         tune.setVerticalSpacing(8)
         tune.setColumnStretch(1, 1)
-        tune.addWidget(label("Rotation", None, wrap=False), 0, 0)
+        tune.addWidget(label("Input method", None, wrap=False), 0, 0)
+        self.input_mode = QComboBox()
+        self.input_mode.setAccessibleName("Art input method")
+        for value, text in zip(INPUT_MODES, MODE_TEXT[""]):
+            self.input_mode.addItem(text, value)
+        self.input_mode.currentIndexChanged.connect(self.refresh_state)
+        tune.addWidget(self.input_mode, 0, 1, 1, 2)
+        self.mode_help = label("", "caption")
+        self.mode_help.setAccessibleName("Input method explanation")
+        tune.addWidget(self.mode_help, 1, 1, 1, 2)
+        self.mac_pen_ack = QCheckBox("I understand macOS pen pressure is experimental and unverified")
+        self.mac_pen_ack.setAccessibleName("Accept experimental macOS pen pressure")
+        self.mac_pen_ack.toggled.connect(self.refresh_state)
+        tune.addWidget(self.mac_pen_ack, 2, 1, 1, 2)
+        tune.addWidget(label("Rotation", None, wrap=False), 3, 0)
         self.rotation = QComboBox()
         self.rotation.setAccessibleName("Tablet rotation")
         for value, text in ROTATIONS:
             self.rotation.addItem(text, value)
-        tune.addWidget(self.rotation, 0, 1, 1, 2)
+        tune.addWidget(self.rotation, 3, 1, 1, 2)
         self.pressure, self.pressure_value = self._slider("Pressure", 5, 100, 50)
         self.curve, self.curve_value = self._slider("Pressure curve", 20, 300, 80)
         self.tilt, self.tilt_value = self._slider("Tilt strength", 0, 300, 0)
         for row, (text, slider, shown) in enumerate((("Pressure", self.pressure, self.pressure_value),
                                                      ("Pressure curve", self.curve, self.curve_value),
-                                                     ("Tilt strength", self.tilt, self.tilt_value)), start=1):
+                                                     ("Tilt strength", self.tilt, self.tilt_value)), start=4):
             tune.addWidget(label(text, None, wrap=False), row, 0)
             tune.addWidget(slider, row, 1)
             tune.addWidget(shown, row, 2)
@@ -128,15 +164,20 @@ class ArtPage(Page):
         self.eraser.setAccessibleName("Eraser size")
         self.eraser_check.toggled.connect(self.refresh_state)
         eraser_row = QHBoxLayout()
+        eraser_row.setSpacing(8)
         eraser_row.addWidget(self.eraser)
         eraser_row.addWidget(label("4 to 200", "caption", wrap=False))
         eraser_row.addStretch(1)
-        tune.addWidget(self.eraser_check, 4, 0)
-        tune.addLayout(eraser_row, 4, 1, 1, 2)
+        tune.addWidget(self.eraser_check, 7, 0)
+        tune.addLayout(eraser_row, 7, 1, 1, 2)
         mode.body.addLayout(tune)
         self.touch_check = QCheckBox("Forward touch gestures (pan, zoom, rotate)")
         self.touch_check.setAccessibleName("Forward touch gestures")
         mode.add(self.touch_check)
+        self.touch_note = mode.add(label("", "caption"))
+        self.touch_note.setAccessibleName("Touch gesture availability")
+        self.host_note = mode.add(label("", "warn"))
+        self.host_note.setAccessibleName("This computer's art input setup")
         mode.add(label("Pressure runs 0.05 to 1, curve 0.2 to 3 and tilt 0 to 3. They are handed to the "
                        "art bridge exactly as shown; it checks them and reports the settings it used. "
                        "They apply the next time tablet mode starts.", "caption"))
@@ -155,8 +196,9 @@ class ArtPage(Page):
 
     def _build_display(self) -> None:
         card = Card("Krita canvas on the tablet",
-                    "Optional, Krita only. It needs three things, and PaperDesk never does the second "
-                    "or third for you without being asked.")
+                    "Optional, Krita only, on Linux, macOS and Windows. Krita's plugin talks to PaperDesk "
+                    "on this computer. It needs three things, and PaperDesk never does the second or "
+                    "third for you without being asked.")
         self.display_steps: list[Any] = []
         for _ in range(3):
             step = label("", None)
@@ -177,8 +219,21 @@ class ArtPage(Page):
         self.plugin_ready.setAccessibleName("Krita plugin enabled and Krita restarted")
         self.plugin_ready.toggled.connect(self.refresh_state)
         card.add(self.plugin_ready)
+        self.plugin_check_button = button("Check plugin", None,
+                                          "Ask Krita's plugin on this computer whether it answers; "
+                                          "nothing is changed and the tablet is not involved")
+        self.plugin_check_button.clicked.connect(self.check_plugin)
+        self.plugin_probe_note = label("Not checked yet. Krita must be open with the plugin enabled for "
+                                       "it to answer.", "muted")
+        self.plugin_probe_note.setAccessibleName("Krita plugin check result")
+        probe = QHBoxLayout()
+        probe.setSpacing(12)
+        probe.addWidget(self.plugin_check_button, 0, Qt.AlignmentFlag.AlignTop)
+        probe.addWidget(self.plugin_probe_note, 1)
+        card.body.addLayout(probe)
         self.display_check = QCheckBox("Show the Krita canvas on the tablet when tablet mode starts")
         self.display_check.setAccessibleName("Show the Krita canvas on the tablet")
+        self.display_check.toggled.connect(self.refresh_state)
         card.add(self.display_check)
         self.display_note = card.add(label("", "warn"))
         self.display_note.setAccessibleName("Canvas display availability")
@@ -202,11 +257,16 @@ class ArtPage(Page):
 
     # -- state ---------------------------------------------------------
     def options(self) -> dict:
-        """Exactly the keys ArtManager.validate_options accepts; touch is always stated."""
+        """Exactly the keys ArtManager.validate_options accepts; touch is always stated.
+
+        The input method is sent only when one was chosen, so Automatic stays the bridge's default.
+        """
         options: dict[str, Any] = {
             "rotation": str(self.rotation.currentData()), "pressure": self.pressure.value() / 100,
             "curve": self.curve.value() / 100, "tilt": self.tilt.value() / 100,
             "touch": self.touch_check.isEnabled() and self.touch_check.isChecked()}
+        if self.input_method() != "auto":
+            options["mode"] = self.input_method()
         if self.eraser_check.isChecked() and self.eraser_check.isEnabled():
             options["eraser"] = self.eraser.value()
         if self.display_check.isEnabled() and self.display_check.isChecked() and self.application == "krita":
@@ -221,7 +281,7 @@ class ArtPage(Page):
     def bridge(self) -> dict:
         """The art bridge's own capability report: from a running session, else from discovery."""
         running = self.win.art_state.get("capabilities")
-        if isinstance(running, dict):
+        if isinstance(running, dict) and self.win.art_state.get("active"):
             return running
         found = self.app_info.get(self.application, {}).get("capabilities")
         return found if isinstance(found, dict) else {}
@@ -237,6 +297,42 @@ class ArtPage(Page):
             if name in caps and name != "art-display":
                 return caps[name]
         return None
+
+    def input_method(self) -> str:
+        return str(self.input_mode.currentData() or "auto")
+
+    def host(self) -> str:
+        """Which kind of computer the art bridge says it runs on: linux, windows, mac or unknown."""
+        bridge = self.bridge()
+        named = str(bridge.get("platform") or "")
+        if named.startswith("linux"):
+            return "linux"
+        if named in ("darwin", "win32"):
+            return "mac" if named == "darwin" else "windows"
+        if bridge.get("experimental_pressure") is True:
+            return "mac"
+        if any(bridge.get(key) is True for key in ("windows_ink_available", "windows_ink", "pointer_only")):
+            return "windows"
+        return "linux" if "linux_driver_installed" in bridge else ""
+
+    def needs_pen_opt_in(self) -> bool:
+        return self.host() == "mac" and self.input_method() == "pen"
+
+    def _native_touch(self) -> bool | None:
+        known = self._capability("native_multitouch")
+        return self._capability("multitouch") if known is None else known
+
+    def _host_problem(self) -> str:
+        """What this computer still lacks for pen input, in the bridge's own terms."""
+        bridge, host = self.bridge(), self.host()
+        if host == "linux" and bridge.get("linux_driver_installed") is False:
+            return ("This computer has no Linux pen driver yet. Install PaperDesk's optional art "
+                    "support (the evdev package); nothing is installed automatically.")
+        if host == "linux" and bridge.get("linux_input_permission") is False:
+            return ("This computer does not let your user create input devices (/dev/uinput is not "
+                    "writable). Your distribution's udev rules grant that; PaperDesk never changes "
+                    "permissions or runs as administrator.")
+        return ""
 
     def installed(self, application: str) -> bool | None:
         info = self.app_info.get(application)
@@ -290,13 +386,33 @@ class ArtPage(Page):
             self.extra_label.setText("Art tablet mode is active on the tablet" if extra
                                      else "Not active — install it in Setup › Features")
             set_role(self.extra_label, "ok" if extra else "warn")
-        bridge = self.bridge()
+        bridge, host, chosen = self.bridge(), self.host(), self.input_method()
+        texts = MODE_TEXT[host]
+        for index, text in enumerate(texts):
+            self.input_mode.setItemText(index, text)
+        mouse_item = self.input_mode.model().item(2)
+        mouse_item.setEnabled(host != "linux")
+        if host == "linux" and chosen == "mouse":
+            self.input_mode.setCurrentIndex(0)  # re-enters refresh_state with Automatic
+            return
+        self.mode_help.setText(MODE_HELP.get((host, chosen), "The art bridge chooses the input it can "
+                                                             "provide on this computer."))
+        opt_in = self.needs_pen_opt_in()
+        self.mac_pen_ack.setVisible(opt_in)
+        if not opt_in and self.mac_pen_ack.isChecked():
+            self.mac_pen_ack.setChecked(False)
+        experimental = opt_in and bridge.get("experimental_pressure") is True
         for key, value in self.cap_labels.items():
-            known = self._capability(key)
-            if key == "art_display" and self.application != "krita":
+            known = self._native_touch() if key == "native_multitouch" else self._capability(key)
+            if key in ("art_display", "canvas_gestures") and self.application != "krita":
                 known = False
-            if known is True:
-                value.setText("Supported")
+            if key in ("pressure", "tilt", "native_multitouch") and chosen == "mouse":
+                known = False
+            if key in ("pressure", "tilt") and experimental:
+                value.setText("Experimental — not verified in an art application")
+                set_role(value, "warn")
+            elif known is True:
+                value.setText("Reported available")
                 set_role(value, "ok")
             elif known is False:
                 value.setText("Not available here")
@@ -308,28 +424,36 @@ class ArtPage(Page):
         limits = str(bridge.get("limits") or "")
         support = str(bridge.get("tablet_support") or "")
         self.limits_label.setText(
-            ("On this computer the pen works as a plain pointer, without pressure or tilt. " if pointer_only
-             else "Where pressure is not reported as supported, the pen is a plain pointer; PaperDesk "
-                  "does not present pointer-only input as pressure support. ")
-            + limits + (f" Validated tablets: {support}." if support else ""))
-        self.ink_note.setVisible(any("ink" in str(key).lower() and value is True
-                                     for key, value in bridge.items()))
+            "“Reported available” is what the art bridge says this computer can do. It is not a test "
+            "with a physical tablet. "
+            + ("Here the pen works as a plain pointer unless the input method below says otherwise. "
+               if pointer_only else "")
+            + (f"Validated tablet: {support}." if support else ""))
+        self.limits_label.setToolTip(limits)  # the bridge's full statement, also in its start report
+        self.limits_label.setAccessibleDescription(limits)
+        self.ink_note.setVisible(chosen != "mouse" and any(
+            "ink" in str(key).lower() and value is True for key, value in bridge.items()))
+        problem = self._host_problem()
+        self.host_note.setText(problem)
+        self.host_note.setVisible(bool(problem))
 
         idle = extra and not active
-        pressure_ok = self._capability("pressure") is not False and not pointer_only
-        self.start_button.setEnabled(idle)
+        if chosen == "mouse":
+            pressure_ok = False
+        elif host == "mac":
+            pressure_ok = chosen == "pen"
+        else:
+            pressure_ok = self._capability("pressure") is not False and not pointer_only
+        self.input_mode.setEnabled(idle)
+        self.mac_pen_ack.setEnabled(idle)
+        self.start_button.setEnabled(idle and (not opt_in or self.mac_pen_ack.isChecked()))
         self.start_button.setText(f"Start tablet mode with {name}")
         self.stop_button.setEnabled(win.connected and active)
         self.rotation.setEnabled(idle)
         for widget in (self.pressure, self.curve, self.eraser_check):
             widget.setEnabled(idle and pressure_ok)
-        self.tilt.setEnabled(idle and pressure_ok and self._capability("tilt") is not False)
+        self.tilt.setEnabled(idle and pressure_ok and (experimental or self._capability("tilt") is not False))
         self.eraser.setEnabled(idle and pressure_ok and self.eraser_check.isChecked())
-        touch_ok = self._capability("multitouch") is True
-        if touch_ok and not self._touch_defaulted:
-            self._touch_defaulted = True
-            self.touch_check.setChecked(True)
-        self.touch_check.setEnabled(idle and touch_ok)
         if active:
             running = APP_NAMES.get(str(win.art_state.get("application")), "the art application")
             self.mode_notice.setText(f"Tablet mode is running with {running}.")
@@ -337,10 +461,38 @@ class ArtPage(Page):
         elif not extra:
             self.mode_notice.setText(win.unsupported_reason("art-display", "art tablet mode"))
             set_role(self.mode_notice, "warn")
+        elif opt_in and not self.mac_pen_ack.isChecked():
+            self.mode_notice.setText("Tick the experimental pen box above to start with pen pressure, "
+                                     "or choose Automatic to use the plain pointer.")
+            set_role(self.mode_notice, "warn")
         else:
             self.mode_notice.setText("Tablet mode is off.")
             set_role(self.mode_notice, "muted")
         self._refresh_display(extra, active)
+        self._refresh_touch(idle, active)
+
+    def _refresh_touch(self, idle: bool, active: bool) -> None:
+        """Touch is native multi-touch where the bridge has it, else gestures through Krita's canvas."""
+        native_ok = self._native_touch() is True and self.input_method() != "mouse"
+        display_on = self.application == "krita" and self.display_check.isChecked()
+        can_gesture = self._capability("canvas_gestures") is True
+        touch_ok = native_ok or (can_gesture and display_on)
+        if native_ok and not self._touch_defaulted:
+            self._touch_defaulted = True
+            self.touch_check.setChecked(True)
+        if not touch_ok and not active and self.touch_check.isChecked():
+            self.touch_check.setChecked(False)
+        self.touch_check.setEnabled(idle and touch_ok)
+        if native_ok:
+            note = "Touch reaches this computer as native multi-touch."
+        elif can_gesture and display_on:
+            note = "Touch gestures go to Krita through the canvas display, not to other applications."
+        elif can_gesture:
+            note = ("This computer has no native multi-touch for this input method. Touch gestures work "
+                    "in Krita once the canvas display below is switched on.")
+        else:
+            note = "Touch gestures are not available on this computer."
+        self.touch_note.setText(note)
 
     def _refresh_display(self, extra: bool, active: bool) -> None:
         win, service = self.win, self.win.service
@@ -363,6 +515,9 @@ class ArtPage(Page):
         self.plugin_plan_button.setEnabled(service is not None)
         self.plugin_button.setEnabled(can_copy and (self._plugin_plan is not None or not can_plan))
         self.plugin_replace_button.setVisible(can_copy and self._plugin_exists)
+        can_probe = callable(getattr(service, "art_plugin_probe", None))
+        self.plugin_check_button.setVisible(can_probe)
+        self.plugin_probe_note.setVisible(can_probe)
         if not can_copy:
             self.plugin_note.setText("This build's device backend offers no plugin copy. Copy the plugin "
                                      "by hand from PaperDesk's art resources, or use a build that has it.")
@@ -374,7 +529,12 @@ class ArtPage(Page):
         elif not extra:
             reason = win.unsupported_reason("art-display", "the canvas display")
         elif display_cap is False:
-            reason = "The art bridge reports that canvas display is not available on this computer."
+            if self.host() == "mac" and self.bridge().get("mac_input_permission") is False:
+                reason = ("macOS has not yet allowed PaperDesk to send input, which the canvas display "
+                          "needs. Allow it in System Settings › Privacy & Security, then reopen this page.")
+            else:
+                reason = self._host_problem() or ("The art bridge reports that canvas display is not "
+                                                  "available on this computer.")
         elif not self.plugin_ready.isChecked():
             reason = "Tick step 3 once the plugin is enabled in Krita and Krita has been restarted."
         else:
@@ -437,6 +597,30 @@ class ArtPage(Page):
         set_role(self.plugin_note, "muted")
         self.refresh_state()
 
+    def check_plugin(self) -> None:
+        """One read-only question to Krita's plugin on this computer; never repeated by itself."""
+        if self.win.run("art-plugin-probe", lambda s: s.art_plugin_probe(), needs_connection=False,
+                        label="Check the Krita plugin", on_done=self._plugin_probed,
+                        on_error=self._plugin_probe_failed):
+            self.plugin_probe_note.setText("Checking…")
+            set_role(self.plugin_probe_note, "muted")
+
+    def _plugin_probed(self, result: Any) -> None:
+        info = result if isinstance(result, dict) else {}
+        failed = info.get("ok") is False
+        text = str(info.get("message") or ("The plugin did not confirm it is ready." if failed
+                                           else "Krita's plugin answered."))
+        if info.get("simulated"):
+            text += " Nothing was asked of a real Krita."
+        elif not failed:
+            text += " Tablet mode asks again when it starts."
+        self.plugin_probe_note.setText(text)
+        set_role(self.plugin_probe_note, "error" if failed else "muted" if info.get("simulated") else "ok")
+
+    def _plugin_probe_failed(self, exc: BaseException) -> None:
+        self.plugin_probe_note.setText(f"The plugin did not answer. {describe_error(exc)}")
+        set_role(self.plugin_probe_note, "error")
+
     def copy_plugin(self, replace: bool) -> None:
         install = method(self.win.service, *ART_PLUGIN)
         if install is None:
@@ -480,6 +664,10 @@ class ArtPage(Page):
     def start_mode(self) -> None:
         if not self.win.supports("art-display"):
             self.win.notify("warn", self.win.unsupported_reason("art-display", "art tablet mode"))
+            return
+        if self.needs_pen_opt_in() and not self.mac_pen_ack.isChecked():
+            self.win.notify("warn", "Not started: tablet mode. Experimental macOS pen pressure needs "
+                                    "your explicit tick on the Art page.")
             return
         app, options = self.application, self.options()
         self.win.run("start-art", lambda s: s.start_art(app, options), mutation=True, key="art-mode",
