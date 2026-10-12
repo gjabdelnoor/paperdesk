@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QSettings, QSize, Qt, Signal
+from PySide6.QtCore import QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QFrame, QHBoxLayout, QMainWindow,
                                QMessageBox, QPlainTextEdit, QStackedWidget, QTreeWidget, QTreeWidgetItem,
@@ -28,7 +28,7 @@ from .widgets import Banner, ElidedLabel, NavButton, StateDot, button, label
 from .worker import Job, OperationRunner, is_uncertain
 
 PAGES = [("home", "Home"), ("library", "Library"), ("type", "Type"), ("art", "Art"), ("setup", "Setup")]
-_CONNECTION_JOBS = {"probe", "trust", "connect", "disconnect", "status", "sandbox-fault"}
+_CONNECTION_JOBS = {"probe", "trust", "connect", "disconnect", "lost-cleanup", "status", "sandbox-fault"}
 SHORTCUTS = [
     ("Ctrl+1 … Ctrl+5", "Home, Library, Type, Art, Setup"),
     ("Ctrl+K", "Connect to the tablet"),
@@ -96,6 +96,12 @@ class MainWindow(QMainWindow):
         self._config: DeviceConfig | None = None
         self._temp: Path | None = None
         self._closed = False
+        self._disconnecting = False
+        self._close_requested = False
+        self._shutdown_complete = False
+        self._close_timer = QTimer(self)
+        self._close_timer.setInterval(100)
+        self._close_timer.timeout.connect(self._poll_close)
         self._log_dialog: QDialog | None = None
         self._shortcut_dialog: QDialog | None = None
         self.simulation_generation = 0
@@ -118,6 +124,7 @@ class MainWindow(QMainWindow):
         self.runner.failed.connect(self._on_failed)
         self.runner.rejected.connect(self._on_rejected)
         self.runner.changed.connect(self._update_queue)
+        self.runner.stopped.connect(self._finish_shutdown)
         self.navigate("home")
         self._refresh()
         if self.service is None:
@@ -164,11 +171,11 @@ class MainWindow(QMainWindow):
 
     def supports(self, feature: str) -> bool:
         """Advanced features are usable only when the tablet reports them; fail closed."""
-        return self._connected and self.capabilities.get(feature) is True
+        return self._connected and not self._disconnecting and not self._closed and self.capabilities.get(feature) is True
 
     def allows(self, capability: str) -> bool:
         """Everyday actions are available unless the tablet explicitly reports them as off."""
-        return self._connected and self.capabilities.get(capability, True) is not False
+        return self._connected and not self._disconnecting and not self._closed and self.capabilities.get(capability, True) is not False
 
     def unsupported_reason(self, feature: str, what: str) -> str:
         if not self._connected:
@@ -437,8 +444,8 @@ class MainWindow(QMainWindow):
             self.art_banner.hide()
         if hasattr(self, "act_connect"):
             self.act_connect.setEnabled(self.service is not None and not self._connected
-                                        and not self._connecting)
-            self.act_disconnect.setEnabled(self._connected)
+                                        and not self._connecting and not self._disconnecting and not self._closed)
+            self.act_disconnect.setEnabled(self._connected and not self._disconnecting and not self._closed)
             self.act_sim.setEnabled(not self._simulated)
             self.act_leave_sim.setEnabled(self._simulated)
         for page in self.pages.values():
@@ -511,10 +518,15 @@ class MainWindow(QMainWindow):
     def run(self, name: str, fn: Callable[[Any], Any], *, label: str, mutation: bool = False,
             needs_connection: bool = True, dedupe: bool = True, key: str | None = None,
             quiet: bool = False, partial: bool = False,
+            cleanup: bool = False,
             on_done: Callable[[Any], None] | None = None,
             on_error: Callable[[BaseException], None] | None = None) -> bool:
         """Queue one backend call.  Returns False, with a visible reason, when refused."""
+        cleanup = cleanup or name in {"stop-art", "disconnect", "lost-cleanup"}
         if self._closed:
+            return False
+        if self._disconnecting and not cleanup:
+            self.notify("warn", "Wait for tablet input and the connection to stop before starting another operation.")
             return False
         if self.service is None:
             self.notify("error", self.backend_error or "The device backend is not available.")
@@ -529,6 +541,7 @@ class MainWindow(QMainWindow):
         service = self.service
         job = Job(name=name, label=label, fn=lambda: fn(service), mutation=mutation, quiet=quiet,
                   partial=partial,
+                  before=None if cleanup else getattr(service, "begin_job", None), cleanup=cleanup,
                   key=(key or name) if dedupe else None, on_done=on_done, on_error=on_error)
         return self.runner.submit(job)
 
@@ -552,7 +565,7 @@ class MainWindow(QMainWindow):
             self.hold_uncertain(job.label, text)
         else:
             self.notify("error", f"Failed: {job.label}. {text}")
-        if self._connected and job.name not in _CONNECTION_JOBS:
+        if self._connected and not self._disconnecting and job.name not in _CONNECTION_JOBS:
             self._verify_connection()
 
     def _on_rejected(self, job: Job, reason: str) -> None:
@@ -624,6 +637,10 @@ class MainWindow(QMainWindow):
             self._refresh()
 
     def _mark_lost(self, detail: str = "") -> None:
+        self._disconnecting = True
+        self._request_cancel()
+        self.runner.cancel_waiting()
+        self._refresh()
         self._connected = False
         self._status = {}
         self.documents = []
@@ -634,6 +651,16 @@ class MainWindow(QMainWindow):
             "When the tablet is awake and plugged in, connect again." + (f" ({detail})" if detail else ""))
         self.notify("error", "Connection lost. Nothing was retried." + (f" {detail}" if detail else ""))
         self.documents_changed.emit()
+        service = self.service
+        if service is not None:
+            def finished(_value):
+                self._disconnecting = False
+                self._refresh()
+            self.run("lost-cleanup", lambda _s: self._cleanup_service(service),
+                     label="Release tablet input and close the lost connection", needs_connection=False,
+                     quiet=True, cleanup=True, on_done=finished, on_error=finished)
+        else:
+            self._disconnecting = False
 
     def _dismiss_lost(self) -> None:
         self.connection_lost = False
@@ -679,7 +706,7 @@ class MainWindow(QMainWindow):
         if self._simulated:
             self.notify("warn", "Leave the simulation before connecting to a real tablet.")
             return False
-        if self._connected or self._connecting:
+        if self._connected or self._connecting or self._disconnecting or self.runner.busy:
             return False
         self._save_connection(config)
         service = self._make(lambda: self.provider.live(config))
@@ -715,11 +742,10 @@ class MainWindow(QMainWindow):
         self._refresh()
 
     def connect_simulator(self, pair: bool = False) -> bool:
-        if not self._simulated or self._connected or self._connecting:
+        if not self._simulated or self._connected or self._connecting or self._disconnecting:
             return False
-        if pair and callable(getattr(self.service, "probe_host_key", None)):
-            self._config = getattr(self.service, "config", None) or DeviceConfig()
-            return self._probe(on_error=self._sim_probe_failed)
+        # SuiteService's pairing API is static and performs real SSH. A demo
+        # never calls it, including reconnecting from the Setup page.
         return self._connect()
 
     def _sim_probe_failed(self, exc: BaseException) -> None:
@@ -831,19 +857,56 @@ class MainWindow(QMainWindow):
         self._refresh()
 
     def disconnect_tablet(self, then: Callable[[], None] | None = None) -> bool:
-        if not self._connected:
+        if self._disconnecting:
+            return False
+        if self.service is None:
             if then:
                 then()
             return False
-        if self.art_state.get("active"):
-            self.pages["art"].stop_mode()
+        self._disconnecting = True
+        self._request_cancel()
+        self.runner.cancel_waiting()
+        self._refresh()
 
         def done(_result: Any) -> None:
+            self._disconnecting = False
             self._reset_connection()
             if then:
                 then()
             self._refresh()
-        return self.run("disconnect", lambda s: s.disconnect(), label="Disconnect", on_done=done)
+        return self.run("disconnect", self._cleanup_service, label="Disconnect", needs_connection=False,
+                        cleanup=True, on_done=done, on_error=done)
+
+    @staticmethod
+    def _cleanup_service(service: Any) -> None:
+        """Release resources by ownership, independently of displayed status."""
+        errors = []
+        for name in ("stop_art", "disconnect"):
+            call = getattr(service, name, None)
+            if callable(call):
+                try:
+                    call()
+                except Exception as exc:
+                    errors.append(describe_error(exc))
+        if errors:
+            raise RuntimeError("Tablet cleanup did not finish cleanly: " + "; ".join(errors))
+
+    def cancel_service_inputs(self) -> None:
+        """Signal a running input job without waiting on the GUI thread."""
+        call = getattr(self.service, "cancel_current", None)
+        if callable(call):
+            try:
+                call()
+            except Exception as exc:
+                self.notify("warn", "Stop requested, but input cleanup reported: " + describe_error(exc))
+
+    def _request_cancel(self) -> None:
+        self.runner.cancel_current()
+        page = self.pages.get("type")
+        if page is not None:
+            page.stop_forwarding()
+            page.ink._cancel.set()
+        self.cancel_service_inputs()
 
     def _reset_connection(self) -> None:
         self._connected = False
@@ -932,27 +995,56 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     # teardown
-    def shutdown(self) -> bool:
-        """Stop art mode, disconnect and stop the worker.  Safe to call twice."""
+    def shutdown(self, timeout_ms: int = 250) -> bool:
+        """Request cleanup; retain the window and its files until it completes."""
         if self._closed:
-            return not self.runner.running
+            done = not self.runner.running
+            if done:
+                self._finish_shutdown()
+            return done
         self._closed = True
+        self._request_cancel()
         final: list[Callable[[], Any]] = []
-        service = self.service
-        if service is not None and self._connected:
-            if self.art_state.get("active"):
-                final.append(service.stop_art)
-            final.append(service.disconnect)
-        done = self.runner.shutdown(final)
+        owned = [self.service, self._live_service]
+        seen: set[int] = set()
+        for service in owned:
+            if service is not None and id(service) not in seen:
+                seen.add(id(service))
+                final.append(lambda service=service: self._cleanup_service(service))
+        done = self.runner.shutdown(final, timeout_ms=timeout_ms)
         self._connected = False
+        if done:
+            self._finish_shutdown()
+        return done
+
+    def _finish_shutdown(self) -> None:
+        if not self._closed or self.runner.running or self._shutdown_complete:
+            return
+        self._shutdown_complete = True
+        self._close_timer.stop()
         if self._temp is not None:
             shutil.rmtree(self._temp, ignore_errors=True)
             self._temp = None
-        return done
+        if self.runner.shutdown_errors:
+            self.notify("warn", "Closing after cleanup reported a problem. Inspect any partial tablet input: "
+                        + "; ".join(describe_error(error) for error in self.runner.shutdown_errors))
+        if self._close_requested:
+            QTimer.singleShot(0, self.close)
+
+    def _poll_close(self) -> None:
+        if not self.runner.running:
+            self._finish_shutdown()
 
     def closeEvent(self, event) -> None:
-        self.shutdown()
-        super().closeEvent(event)
+        self._close_requested = True
+        if self.shutdown(timeout_ms=25):
+            event.accept()
+            super().closeEvent(event)
+        else:
+            event.ignore()
+            self.notify("busy", "Closing: stopping tablet input and waiting for the current operation and cleanup. "
+                        "Inspect any partial input on the tablet; nothing will be replayed.")
+            self._close_timer.start()
 
     def sizeHint(self) -> QSize:
         return QSize(1080, 740)

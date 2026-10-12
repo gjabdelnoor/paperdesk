@@ -8,15 +8,15 @@ behind it: nothing is ever retried.
 from __future__ import annotations
 
 import traceback
+import threading
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 _UNCERTAIN_NAME_HINTS = ("unknownmutation", "uncertain", "unknownoutcome", "outcomeunknown",
                          "indeterminate", "unknownresult", "unknownstate")
-_orphans: list[tuple[QThread, QObject]] = []
 
 
 def is_uncertain(exc: BaseException) -> bool:
@@ -45,6 +45,9 @@ class Job:
     on_done: Callable[[Any], None] | None = None
     on_error: Callable[[BaseException], None] | None = None
     id: int = 0
+    before: Callable[[], Any] | None = None
+    cleanup: bool = False  # must survive a preceding cancelled/failed mutation
+    cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 class _Worker(QObject):
@@ -70,6 +73,7 @@ class OperationRunner(QObject):
     failed = Signal(object, object)
     rejected = Signal(object, str)
     changed = Signal()
+    stopped = Signal()
 
     _dispatch = Signal(int, object)
     _stop = Signal()
@@ -81,6 +85,7 @@ class OperationRunner(QObject):
         self._current: Job | None = None
         self._closed = False
         self._next_id = 1
+        self.shutdown_errors: list[BaseException] = []
         self._thread = QThread()
         self._thread.setObjectName("paperdesk-operations")
         self._worker = _Worker()
@@ -88,6 +93,7 @@ class OperationRunner(QObject):
         self._dispatch.connect(self._worker.execute)
         self._stop.connect(self._worker.stop)
         self._worker.finished.connect(self._on_finished)
+        self._thread.finished.connect(self._on_stopped)
         self._thread.start()
 
     # -- state ---------------------------------------------------------
@@ -119,7 +125,7 @@ class OperationRunner(QObject):
         if job.key is not None and self.has_key(job.key):
             self.rejected.emit(job, "duplicate")
             return False
-        if len(self._queue) >= self.max_waiting:
+        if not job.cleanup and len(self._queue) >= self.max_waiting:
             self.rejected.emit(job, "full")
             return False
         job.id = self._next_id
@@ -133,7 +139,18 @@ class OperationRunner(QObject):
         if self._current is None and self._queue and not self._closed:
             self._current = self._queue.popleft()
             self.started.emit(self._current)
-            self._dispatch.emit(self._current.id, self._current.fn)
+            job = self._current
+            def execute():
+                if job.cancelled.is_set():
+                    raise RuntimeError("Operation cancelled before execution.")
+                if job.before is not None:
+                    job.before()
+                # A stop can arrive between dispatch and begin_job, whose
+                # reset must never erase a stop for this already queued job.
+                if job.cancelled.is_set():
+                    raise RuntimeError("Operation cancelled before execution.")
+                return job.fn()
+            self._dispatch.emit(job.id, execute)
 
     @Slot(int, object, object)
     def _on_finished(self, job_id: int, result: Any, error: BaseException | None) -> None:
@@ -145,12 +162,13 @@ class OperationRunner(QObject):
             self.succeeded.emit(job, result)
             self._call(job.on_done, result)
         else:
-            dropped = list(self._queue)
-            self._queue.clear()
+            dropped = [waiting for waiting in self._queue if not waiting.cleanup]
+            self._queue = deque(waiting for waiting in self._queue if waiting.cleanup)
             self.failed.emit(job, error)
             self._call(job.on_error, error)
             for waiting in dropped:
                 self.rejected.emit(waiting, "cancelled")
+                self._call(waiting.on_error, RuntimeError("Queued operation cancelled before execution."))
         self._pump()
         self.changed.emit()
 
@@ -164,32 +182,49 @@ class OperationRunner(QObject):
             traceback.print_exc()
 
     # -- teardown ------------------------------------------------------
-    def shutdown(self, final: list[Callable[[], Any]] | None = None, timeout_ms: int = 8000) -> bool:
+    def cancel_current(self) -> None:
+        if self._current is not None and not self._current.cleanup:
+            self._current.cancelled.set()
+
+    def cancel_waiting(self, predicate: Callable[[Job], bool] | None = None) -> None:
+        """Discard only the selected waiting jobs; never interrupt their worker."""
+        dropped = [job for job in self._queue if not job.cleanup and (predicate is None or predicate(job))]
+        self._queue = deque(job for job in self._queue if job not in dropped)
+        for job in dropped:
+            self.rejected.emit(job, "cancelled")
+            self._call(job.on_error, RuntimeError("Queued operation cancelled before execution."))
+        self.changed.emit()
+
+    @Slot()
+    def _on_stopped(self) -> None:
+        self._current = None
+        self.changed.emit()
+        self.stopped.emit()
+
+    def shutdown(self, final: list[Callable[[], Any]] | None = None, timeout_ms: int = 0) -> bool:
         """Drop waiting jobs, run the given closing calls, stop the thread.
 
-        Returns True when the thread has finished.  A backend call that never
-        returns cannot be interrupted; in that case the thread is parked so Qt
-        does not destroy it while running, and False is returned.
+        Returns True only after the thread has finished. The owner keeps the
+        window and its files alive until ``stopped``; no running thread is
+        abandoned, and cleanup never clears a pending cancellation signal.
         """
         if not self._thread.isRunning():
             self._closed = True
+            self._current = None
             return True
-        self._closed = True
-        self._queue.clear()
-        for fn in final or []:
-            self._dispatch.emit(-1, _guarded(fn))
-        self._stop.emit()
+        if not self._closed:
+            self._closed = True
+            self.cancel_waiting()
+            self._queue.clear()  # final cleanup supersedes any queued cleanup
+            def cleanup():
+                for fn in final or []:
+                    try:
+                        fn()
+                    except BaseException as exc:
+                        self.shutdown_errors.append(exc)
+            self._dispatch.emit(-1, cleanup)
+            self._stop.emit()
         done = self._thread.wait(timeout_ms)
-        if not done:
-            _orphans.append((self._thread, self._worker))
-        self._current = None
+        if done:
+            self._current = None
         return done
-
-
-def _guarded(fn: Callable[[], Any]) -> Callable[[], Any]:
-    def call() -> None:
-        try:
-            fn()
-        except Exception:
-            pass
-    return call

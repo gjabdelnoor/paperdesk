@@ -17,8 +17,10 @@ import shlex
 import stat
 import struct
 import tempfile
+import threading
 import time
 import uuid
+import zipfile
 from pathlib import Path
 
 from .models import DeviceConfig
@@ -105,7 +107,9 @@ def _destination(destination: str, name: str, suffix: str) -> Path:
 class SuiteService:
     def __init__(self, config: DeviceConfig):
         self.config = config
-        self.state_dir = state_directory(config)
+        self._state_base = state_directory(config)
+        endpoint = f"{config.host.lower()}:{config.port}:{config.username}"
+        self.state_dir = self._state_base / "devices" / ("endpoint-" + hashlib.sha256(endpoint.encode("utf-8")).hexdigest())
         self.transport = SSHTransport(config)
         self.simulator = None
         self.simulated = False
@@ -119,6 +123,10 @@ class SuiteService:
         self._touch_position = (0.5, 0.5)
         self._last_refresh = 0.0
         self._ink_probed = False
+        self._cancel_event = threading.Event()
+        self._job_lock = threading.RLock()
+        self._stream_lock = threading.RLock()
+        self._active_jobs = 0
 
     @classmethod
     def demo(cls, root: Path | None = None, model: str = "paper-pro", firmware: str = FIRMWARE) -> "SuiteService":
@@ -162,10 +170,16 @@ class SuiteService:
         return self._art
 
     def connect(self) -> dict:
+        self.begin_job()
         if self.simulated:
             self.simulator.connected = True
         elif not self.transport.connected:
             self.transport.connect()
+        if not self.simulated:
+            observed = self.transport.host_fingerprint
+            if isinstance(observed, str) and observed.startswith("SHA256:"):
+                self.state_dir = self._state_base / "devices" / ("ssh-" + hashlib.sha256(observed.encode("ascii")).hexdigest())
+                self._installer = None
         self._connected = True
         self._input_uncertain = False
         try:
@@ -175,6 +189,7 @@ class SuiteService:
             raise
 
     def disconnect(self) -> None:
+        self.cancel_current()
         if self._art is not None:
             self._art.stop()
         for stream in (self._keyboard, self._touch):
@@ -188,6 +203,78 @@ class SuiteService:
             self.transport.close()
         self._connected = False
         self._ink_probed = False
+
+    def begin_job(self) -> None:
+        """Reset cancellation only before a new, explicitly requested job.
+
+        Call from the worker before starting that job, never for queued
+        disconnect/shutdown cleanup. A running job cannot clear its stop flag.
+        """
+        with self._job_lock:
+            if self._active_jobs:
+                raise DeviceError("Wait for the current input operation to stop before starting another job.")
+            self._cancel_event.clear()
+
+    def cancel_current(self) -> dict:
+        """Prompt, thread-safe stop signal callable from the GUI thread."""
+        self._cancel_event.set()
+        with self._stream_lock:
+            streams = [self._keyboard, self._touch]
+            self._keyboard = self._touch = None
+            self._touch_down = False
+        for stream in streams:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass  # cancellation must still reach the remaining streams
+        if not self.simulated:
+            self.transport.cancel_streams()
+        session = getattr(self._art, "_session", None)
+        event = getattr(session, "stop_event", None)
+        if event is not None:
+            event.set()  # normal worker stop_art performs final native cleanup
+        return {"ok": True, "message": "Stop requested. Inspect any partial tablet input before sending another operation."}
+
+    def _check_cancelled(self, sent: int = 0) -> None:
+        if self._cancel_event.is_set():
+            if sent:
+                self._input_uncertain = True
+                raise UnknownMutation(f"Tablet input was stopped after {sent} characters or records may have arrived. Inspect the tablet; no input will be replayed.")
+            raise DeviceError("Operation cancelled before input was sent. Start a new explicit job or reconnect to continue.")
+
+    @contextlib.contextmanager
+    def _input_job(self):
+        with self._job_lock:
+            self._check_cancelled()
+            self._active_jobs += 1
+        try:
+            yield
+        finally:
+            with self._job_lock:
+                self._active_jobs -= 1
+
+    @staticmethod
+    def _validate_exported_pdf(path: Path) -> None:
+        """Reject truncated files and PDFs that MuPDF silently repairs."""
+        import pymupdf
+        try:
+            with path.open("rb") as handle:
+                handle.seek(max(0, path.stat().st_size - 4096))
+                tail = handle.read()
+            if not re.search(br"%%EOF\s*$", tail):
+                raise DeviceError("The tablet PDF export is incomplete: its final EOF marker is missing.")
+            with pymupdf.open(str(path)) as document:
+                if not document.is_pdf or document.is_repaired or document.needs_pass or document.page_count < 1:
+                    raise DeviceError("The tablet PDF export is corrupt or requires repair; no complete copy was saved.")
+                for page in document:
+                    page.get_displaylist()
+                if document.is_repaired:
+                    raise DeviceError("The tablet PDF export required repair during validation; no complete copy was saved.")
+        except DeviceError:
+            raise
+        except Exception as exc:
+            raise DeviceError("The tablet PDF export failed completeness validation; no complete copy was saved.") from exc
 
     def status(self) -> dict:
         if not self._connected:
@@ -330,6 +417,72 @@ class SuiteService:
         except (ValueError, OSError, AttributeError, DeviceError) as exc:
             raise DeviceError("The upload journal is invalid. Inspect uploads.json before making another import.") from exc
 
+    def _refuse_legacy_unknown(self, kind: str) -> None:
+        """Keep old global journals intact; never silently apply them to a tablet."""
+        legacy_upload = self._state_base / "uploads.json"
+        if kind == "upload" and legacy_upload.exists():
+            try:
+                old = json.loads(legacy_upload.read_text(encoding="utf-8"))
+                records = old["operations"]
+                if not isinstance(records, list):
+                    raise ValueError()
+                if any(item.get("state") in ("pending", "unknown") for item in records):
+                    raise UnknownMutation("An old unscoped upload journal contains an unknown import. It is preserved; review and explicitly migrate it to the correct tablet before importing again. No POST was sent.")
+            except UnknownMutation:
+                raise
+            except (ValueError, KeyError, OSError, AttributeError) as exc:
+                raise DeviceError("An old unscoped upload journal requires review. It is preserved and will not be replayed or migrated automatically.") from exc
+        legacy = self._state_base / "requests" / kind
+        if kind in ("images", "pages") and legacy.exists():
+            for directory in legacy.iterdir():
+                if (directory / "send-attempted").exists():
+                    try:
+                        result = json.loads((directory / "result.json").read_text(encoding="utf-8"))
+                    except (ValueError, OSError):
+                        result = {}
+                    if result.get("state") not in ("persisted", "rejected"):
+                        raise UnknownMutation("An old unscoped native request has an unknown outcome. Review and explicitly migrate its journal to the correct tablet; no new request was sent.")
+
+    @staticmethod
+    def _rmdoc_identity(path: Path) -> dict:
+        """Read one bounded ZIP metadata member without extracting any paths."""
+        try:
+            with path.open("rb") as handle:
+                handle.seek(max(0, path.stat().st_size - 65557))
+                tail = handle.read()
+            offset = tail.rfind(b"PK\x05\x06")
+            if offset < 0 or len(tail) - offset < 22:
+                raise ValueError()
+            end = struct.unpack_from("<4s4H2IH", tail, offset)
+            if end[1] or end[2] or end[3] != end[4] or not 1 <= end[4] <= 10000 or end[5] > 8 * 1024 * 1024 or end[5] == 0xffffffff:
+                raise ValueError()
+            with zipfile.ZipFile(path) as archive:
+                infos = archive.infolist()
+                if len(infos) != end[4]:
+                    raise ValueError()
+                names = [info.filename for info in infos]
+                if len(names) != len(set(names)):
+                    raise ValueError()
+                for info in infos:
+                    name = info.filename
+                    if len(name) > 512 or name.startswith("/") or "\\" in name or "\x00" in name or any(part in (".", "..") for part in name.split("/")) or stat.S_ISLNK(info.external_attr >> 16):
+                        raise ValueError()
+                metadata = [info for info in infos if re.fullmatch(r"[0-9a-f-]{36}\.metadata", info.filename)]
+                if len(metadata) != 1 or metadata[0].file_size > 1024 * 1024 or metadata[0].compress_size > 1024 * 1024 or metadata[0].flag_bits & 1:
+                    raise ValueError()
+                identifier = _uuid(metadata[0].filename[:-9])
+                with archive.open(metadata[0]) as member:
+                    raw = member.read(1024 * 1024 + 1)
+                if len(raw) > 1024 * 1024:
+                    raise ValueError()
+                value = json.loads(raw)
+                title = value.get("visibleName") if isinstance(value, dict) else None
+                if not isinstance(title, str) or not title or len(title) > 1000 or any(ord(char) < 32 for char in title):
+                    raise ValueError()
+                return {"document_id": identifier, "name": title}
+        except (ValueError, OSError, KeyError, zipfile.BadZipFile, RuntimeError) as exc:
+            raise DeviceError("The RMDOC archive has invalid or oversized native metadata. No tablet import was sent.") from exc
+
     def _save_uploads(self, data: dict) -> None:
         atomic_json(self.state_dir / "uploads.json", data)
 
@@ -358,6 +511,7 @@ class SuiteService:
                 raise DeviceError("Enable Settings → Storage → USB web interface on the tablet before uploading.")
 
     def _web_post_file(self, path: Path, source: dict) -> None:
+        self._check_cancelled()
         boundary = "PaperDesk" + uuid.uuid4().hex
         filename = _safe_name(path.name).replace('"', "_")
         prefix = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
@@ -369,10 +523,13 @@ class SuiteService:
             connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
             connection.putheader("Content-Length", str(len(prefix) + source["size"] + len(suffix)))
             connection.endheaders()
+            self._check_cancelled()
             connection.send(prefix)
             with path.open("rb") as handle:
                 sent = 0
                 while True:
+                    if self._cancel_event.is_set():
+                        raise UnknownMutation("The upload was stopped after it began. Its outcome is unknown; inspect the tablet and journal before any additional import.")
                     chunk = handle.read(1024 * 1024)
                     if not chunk:
                         break
@@ -388,6 +545,11 @@ class SuiteService:
 
     def upload(self, path: str, folder: str = "") -> dict:
         self._require_connected()
+        with self._input_job():
+            return self._upload_job(path, folder)
+
+    def _upload_job(self, path: str, folder: str = "") -> dict:
+        self._refuse_legacy_unknown("upload")
         if self.simulated:
             return self.simulator.upload(path, folder)
         source_path = Path(path).expanduser()
@@ -395,6 +557,7 @@ class SuiteService:
             raise DeviceError("The native tablet importer accepts PDF, EPUB, and RMDOC files.")
         with PortableLock(self.state_dir / "writer.lock"):
             source = _source_snapshot(source_path)
+            native = self._rmdoc_identity(source_path) if source_path.suffix.lower() == ".rmdoc" else None
             before = self._inventory()
             folder_id = self._folder(folder, before)
             journal = self._load_uploads()
@@ -403,6 +566,8 @@ class SuiteService:
                 raise DeviceError("The upload journal contains multiple active records for this file; inspect it before proceeding.")
             if same:
                 return self._reconcile_upload(same[0], before, journal)
+            if native and (native["document_id"] in before or self.transport.exists(f"{STORE}/{native['document_id']}.metadata")):
+                raise DeviceError("This RMDOC carries a document identifier already present on the tablet. Import was refused to preserve the existing document; create a separate native copy first.")
             # Selecting the native folder is not a document mutation. A failed
             # selection records no pending import and can be safely retried.
             self._web_select(folder_id)
@@ -412,6 +577,9 @@ class SuiteService:
                          "folder_id": folder_id, "before_ids": sorted(before), "started_at": time.time(),
                          "expected_names": list(dict.fromkeys((source_path.name, source_path.stem, _safe_name(source_path.name), Path(_safe_name(source_path.name)).stem)))}
             journal["operations"].append(operation)
+            if native:
+                operation["source_document_id"] = native["document_id"]
+                operation["expected_names"].append(native["name"])
             self._save_uploads(journal)  # durable before the first POST byte
             try:
                 self._web_post_file(source_path, source)
@@ -489,6 +657,9 @@ class SuiteService:
                 response = connection.getresponse()
                 if response.status != 200:
                     raise DeviceError("Native PDF export failed. Enable the tablet USB web interface and check the selected document.")
+                expected = response.length
+                if expected is not None and (not isinstance(expected, int) or expected < 1):
+                    raise DeviceError("The tablet returned an invalid PDF transfer length.")
                 first = response.read(8)
                 if not first.startswith(b"%PDF-"):
                     raise DeviceError("The tablet returned an invalid PDF export.")
@@ -502,8 +673,13 @@ class SuiteService:
                             break
                         handle.write(chunk)
                         total += len(chunk)
+                    if expected is not None and total != expected:
+                        raise DeviceError("The tablet PDF transfer was truncated; no complete copy was saved.")
+                    if response.length not in (None, 0):
+                        raise DeviceError("The tablet PDF transfer ended before its declared length; no complete copy was saved.")
                     handle.flush()
                     os.fsync(handle.fileno())
+            self._validate_exported_pdf(output)
             return {"ok": True, "message": "Native PDF export saved as a new copy, including tablet ink and images.", "path": str(output), "id": document_id, "bytes": total, "includes_annotations": True}
         except Exception as exc:
             if created:
@@ -637,6 +813,8 @@ class SuiteService:
 
     def paste_image(self, path: str) -> dict:
         self._require_connected()
+        self._check_cancelled()
+        self._refuse_legacy_unknown("images")
         if self.simulated:
             return self.simulator.paste_image(path)
         with PortableLock(self.state_dir / "writer.lock"):
@@ -673,6 +851,8 @@ class SuiteService:
 
     def add_page(self, template: str) -> dict:
         self._require_connected()
+        self._check_cancelled()
+        self._refuse_legacy_unknown("pages")
         templates = {"cornell": "P Cornell", "grid": "P Grid medium", "lined": "P Lines medium", "blank": "Blank"}
         if template not in templates:
             raise DeviceError("Choose Cornell, grid, lined, or blank for the new page.")
@@ -745,17 +925,26 @@ class SuiteService:
             return {"ok": True, "message": "Tablet screenshot saved as a new copy.", "path": str(output), "width": current.get("capture_width"), "height": current.get("capture_height"), "bytes": len(data)}
 
     def _input_stream(self, kind: str):
+        self._check_cancelled()
         if self._input_uncertain:
             raise UnknownMutation("The previous input was interrupted and may have partly arrived. Inspect the tablet and reconnect; input will not be replayed.")
         path = KEYBOARD if kind == "keyboard" else TOUCH
         attribute = "_keyboard" if kind == "keyboard" else "_touch"
-        stream = getattr(self, attribute)
+        with self._stream_lock:
+            stream = getattr(self, attribute)
         if stream is None or stream.closed:
             if not self.transport.exists(path):
                 raise DeviceError(f"Install the {kind} helper explicitly through the install wizard first.")
             stream = self.transport.stream("exec " + shlex.quote(path), timeout=30)
-            setattr(self, attribute, stream)
-            time.sleep(1)  # uinput must register before the first event
+            with self._stream_lock:
+                if self._cancel_event.is_set():
+                    stream.close()
+                    self._check_cancelled()
+                setattr(self, attribute, stream)
+            # uinput registration needs time; an explicit stop wakes this wait.
+            if self._cancel_event.wait(1):
+                stream.close()
+                self._check_cancelled()
             if stream.channel.exit_status_ready():
                 stream.close()
                 raise DeviceError(f"The tablet {kind} helper could not start. Check its installation and /dev/uinput.")
@@ -765,6 +954,7 @@ class SuiteService:
         # Helper availability/readiness checks happen before any input byte.
         # Their errors are ordinary preflight failures, not unknown mutations.
         stream = self._input_stream(kind)
+        self._check_cancelled()
         try:
             stream.write(data)
         except UnknownMutation:
@@ -783,20 +973,30 @@ class SuiteService:
         if not isinstance(text, str) or len(text) > 100000:
             raise DeviceError("Enter no more than 100,000 characters.")
         if self.simulated:
-            return self.simulator.type_text(text)
+            with self._input_job():
+                return self.simulator.type_text(text)
         normalized = text.replace("\r\n", "\n").replace("\r", "\n").translate(PUNCTUATION)
         unsupported = sorted({char for char in normalized if char not in KEYMAP and char not in "\n\t"})
         if unsupported:
             raise DeviceError("The tablet keyboard helper supports the US ASCII layout. Replace unsupported characters before sending; no input was sent.")
-        with PortableLock(self.state_dir / "writer.lock"):
+        sent = 0
+        with self._input_job(), PortableLock(self.state_dir / "writer.lock"):
             for char in normalized:
+                self._check_cancelled(sent)
                 if char in "\n\t":
                     payload = self._tap(28 if char == "\n" else 15)
                 else:
                     code, shifted = KEYMAP[char]
                     payload = self._tap(code, 42 if shifted else None)
-                self._send_input(payload)
-                time.sleep(0.2)
+                try:
+                    self._send_input(payload)
+                except DeviceError:
+                    if self._cancel_event.is_set():
+                        self._check_cancelled(sent)
+                    raise
+                sent += 1
+                if self._cancel_event.wait(0.2):
+                    self._check_cancelled(sent)
         return {"ok": True, "message": "Text sent through the tablet keyboard. Check the focused text field on the tablet.", "characters": len(normalized), "normalized_punctuation": normalized != text}
 
     def send_key(self, key: str) -> dict:
@@ -804,19 +1004,26 @@ class SuiteService:
         if key not in (*KEYS, "erase-five", "copy", "paste", "close"):
             raise DeviceError("Choose a supported keyboard action.")
         if self.simulated:
-            return self.simulator.send_key(key)
-        with PortableLock(self.state_dir / "writer.lock"):
+            with self._input_job():
+                return self.simulator.send_key(key)
+        sent = 0
+        with self._input_job(), PortableLock(self.state_dir / "writer.lock"):
             if key == "erase-five":
                 for _ in range(5):
-                    self._send_input(self._tap(14)); time.sleep(0.2)
+                    self._check_cancelled(sent)
+                    self._send_input(self._tap(14)); sent += 1
+                    if self._cancel_event.wait(0.2):
+                        self._check_cancelled(sent)
             elif key in ("copy", "paste", "close"):
                 self._send_input(self._tap({"copy":46, "paste":25, "close":17}[key], 29))
             else:
                 self._send_input(self._tap(KEYS[key]))
+            self._check_cancelled(sent or 1)
         return {"ok": True, "message": "Keyboard action sent to the tablet's focused control.", "key": key}
 
     def touch(self, phase: str, x: float, y: float) -> dict:
         self._require_connected()
+        self._check_cancelled()
         if phase not in ("down", "move", "up") or any(not isinstance(value, (float, int)) or isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1 for value in (x,y)):
             raise DeviceError("Touch uses down/move/up with normalized x and y between 0 and 1.")
         if self.simulated:
@@ -967,7 +1174,10 @@ class SuiteService:
 
     def probe_ink(self) -> dict:
         self._require_connected()
+        self._check_cancelled()
         info = self.installer.probe()
+        if info.get("unsafe_paths"):
+            raise DeviceError("Experimental ink setup was refused because an app installation path is a symlink. No helper was provisioned; inspect the installation paths.")
         if info.get("model") != "paper-pro" or info.get("firmware") != FIRMWARE or info.get("xochitl_sha256") != XOCHITL_SHA256:
             raise DeviceError("Experimental figure ink requires the exactly supported Paper Pro firmware and xochitl build.")
         if self.simulated:
@@ -981,8 +1191,15 @@ class SuiteService:
         self._ink_probed = True
         return result
 
-    def stream_ink(self, strokes, cancelled=lambda: False, progress=lambda n,total: None) -> dict:
+    def stream_ink(self, strokes, cancelled=None, progress=lambda n,total: None) -> dict:
+        with self._input_job():
+            return self._stream_ink_job(strokes, cancelled, progress)
+
+    def _stream_ink_job(self, strokes, cancelled, progress) -> dict:
         self._require_connected()
+        if cancelled is not None and not callable(cancelled):
+            raise DeviceError("Ink cancellation must be a callable stop check.")
+        stopped = lambda: self._cancel_event.is_set() or bool(cancelled and cancelled())
         if not self._ink_probed:
             raise DeviceError("Check the pen and inspect a calibration mark before drawing experimental ink.")
         # The GUI owns separate preview/calibration confirmations. The service
@@ -995,7 +1212,7 @@ class SuiteService:
             from .vendor.ink.geometry import protocol
             records = protocol(strokes)
             for index, _record in enumerate(records):
-                if cancelled():
+                if stopped():
                     raise UnknownMutation("Simulated ink was cancelled after partial records; no automatic replay occurs.")
                 progress(index + 1, len(records))
             self.simulator._record("figure-ink", records=len(records))
@@ -1003,7 +1220,7 @@ class SuiteService:
         from .figure_tools import stream_ink
         with PortableLock(self.state_dir / "writer.lock"):
             try:
-                return stream_ink(self.transport, strokes, cancelled, progress)
+                return stream_ink(self.transport, strokes, stopped, progress)
             except Exception as exc:
                 self._ink_probed = False
                 raise UnknownMutation("Ink streaming stopped and partial marks may remain. Inspect the tablet; no strokes will be replayed.") from exc

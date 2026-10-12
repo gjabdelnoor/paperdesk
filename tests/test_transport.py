@@ -2,6 +2,7 @@
 import io
 import json
 import stat
+import socket
 from contextlib import contextmanager
 from unittest.mock import Mock
 
@@ -99,6 +100,32 @@ def test_write_restricted_and_symlink_escape_rejected(tmp_path):
     with pytest.raises(DeviceError,match="symlink"):
         transport.write_bytes("/home/root/.local/lib/paperdesk/current/helper",b"synthetic")
     assert not files.open.called
+
+
+@pytest.mark.parametrize("failure", [EOFError("lost"), socket.timeout("timeout"), paramiko.SSHException("broken session")])
+def test_lost_atomic_write_receipt_reports_unknown_even_if_cleanup_fails(tmp_path,failure):
+    transport = SSHTransport(DeviceConfig(state_dir=tmp_path))
+    files = Mock()
+    files.lstat.return_value = Mock(st_mode=stat.S_IFDIR)
+    files.open.return_value.__enter__ = Mock(return_value=Mock())
+    files.open.return_value.__exit__ = Mock(return_value=False)
+    files.posix_rename.side_effect = failure
+    files.remove.side_effect = EOFError("cleanup link also lost")
+    transport._files = Mock(return_value=files)
+    with pytest.raises(UnknownMutation) as outcome:
+        transport.write_bytes("/home/root/.local/lib/paperdesk/stage/file",b"synthetic")
+    assert outcome.value.no_retry
+    files.rename.assert_not_called()
+
+
+def test_interrupted_sftp_download_removes_only_new_partial_copy(tmp_path):
+    transport = SSHTransport(DeviceConfig(state_dir=tmp_path))
+    files = Mock(); files.open.side_effect = paramiko.SSHException("lost")
+    transport._files = Mock(return_value=files)
+    target = tmp_path / "new-copy.pdf"
+    with pytest.raises(DeviceError,match="interrupted"):
+        transport.download("/home/root/synthetic.pdf",target)
+    assert not target.exists()
 
 
 def stalled_channel():

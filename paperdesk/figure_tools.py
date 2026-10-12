@@ -13,7 +13,7 @@ from .vendor.ink.native_image_rmdoc import write_rmdoc
 
 FIRMWARE = "3.28.0.172"
 XOCHITL_SHA256 = "b1816408cf90b19e448c70082625c4d6a36060368706eb7a9b35425428a9a021"
-REMOTE_HELPER = "/home/root/.local/lib/paperdesk/figure-ink"
+REMOTE_HELPER = "/home/root/.local/lib/paperdesk/current/bin/figure-ink"
 
 
 def create_sticker(image_path: str, output_path: str) -> Path:
@@ -37,7 +37,7 @@ def create_sticker(image_path: str, output_path: str) -> Path:
             im.thumbnail((1290, 1660), Image.Resampling.LANCZOS)
             im.save(png)
         generated = Path(temp) / "sticker.rmdoc"
-        write_rmdoc(png, generated)
+        write_rmdoc(png, generated, visible_name=target.stem)
         with target.open("xb") as out, generated.open("rb") as data:
             for block in iter(lambda: data.read(1024 * 1024), b""):
                 out.write(block)
@@ -78,7 +78,7 @@ def _read_exact(stream, amount: int, deadline: float) -> bytes:
 
 
 def probe_ink(transport, info: dict) -> dict:
-    """Explicitly provision an app-owned helper and probe physical pen axes."""
+    """Verify a wizard-managed helper and probe physical pen axes; no provisioning."""
     if (info.get("model") not in ("paper-pro", "Paper Pro", "reMarkable Paper Pro", "ferrari")
             or info.get("firmware") != FIRMWARE):
         raise RuntimeError("Experimental ink requires the verified Paper Pro firmware 3.28.0.172")
@@ -86,8 +86,8 @@ def probe_ink(transport, info: dict) -> dict:
     if observed != XOCHITL_SHA256:
         raise RuntimeError("The tablet app build is unverified; no ink helper was installed")
     binary = (Path(__file__).parent / "vendor/ink/stylus-injector-aarch64").read_bytes()
-    transport.run("mkdir -p -m 700 /home/root/.local/lib/paperdesk")
-    transport.write_bytes(REMOTE_HELPER, binary, mode=0o700)
+    if not transport.exists(REMOTE_HELPER):
+        raise RuntimeError("Install Keyboard forwarding in Setup first; the verified ink helper is required.")
     digest = transport.run(f"sha256sum {REMOTE_HELPER}").split()[0]
     if digest != hashlib.sha256(binary).hexdigest():
         raise RuntimeError("Ink helper transfer verification failed")

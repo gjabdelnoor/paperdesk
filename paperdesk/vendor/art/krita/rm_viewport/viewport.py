@@ -28,15 +28,26 @@ except ImportError:
 
 def socket_path():
     override = os.environ.get('RM_VIEWPORT_SOCKET')
-    if override: return override
+    if override:
+        if sys.platform == 'win32': return override
+        directory = os.path.dirname(os.path.abspath(override))
+        if os.path.islink(directory) or not os.path.isdir(directory): raise RuntimeError('Viewport socket override needs a private directory')
+        info = os.stat(directory)
+        if hasattr(os, 'getuid') and info.st_uid != os.getuid(): raise RuntimeError('Viewport socket override has a different owner')
+        if info.st_mode & 0o077: raise RuntimeError('Viewport socket override directory must be private (mode 0700)')
+        return override
     if sys.platform == 'win32':
-        base = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~/AppData/Local')), 'PaperDesk', 'Cache')
+        identity = os.path.expanduser('~').replace('\\', '/').casefold()
+        return 'PaperDeskViewport-'+hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]
     elif sys.platform == 'darwin':
         base = os.path.expanduser('~/Library/Caches/PaperDesk')
     else:
         base = os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache')
         if not os.environ.get('FLATPAK_ID'): base = os.path.join(base, 'PaperDesk')
     os.makedirs(base, mode=0o700, exist_ok=True)
+    if os.path.islink(base): raise RuntimeError('Viewport socket directory must not be a symlink')
+    if hasattr(os, 'getuid') and os.stat(base).st_uid != os.getuid(): raise RuntimeError('Viewport socket directory has a different owner')
+    os.chmod(base, 0o700)
     return os.path.join(base, 'paperdesk-viewport.sock')
 
 SOCKET = socket_path()
@@ -191,6 +202,7 @@ class ViewportExtension(Extension):
         self.schedule()
     def handle(self, request):
         op = request.get('op')
+        if op == 'ping': return {'app': 'paperdesk-viewport', 'protocol': 1}, b''
         if op == 'frame':
             w, h = int(request['w']), int(request['h'])
             if not 1 <= w <= 4096 or not 1 <= h <= 4096: return {'error': 'frame dimensions out of range'}, b''
@@ -287,7 +299,12 @@ class ViewportExtension(Extension):
         if not (16 <= w <= 4096 and 16 <= h <= 4096 and turn in (0, 90, 180, 270)): raise ValueError('bad frame request')
         scene = Scene(w/h); document = scene.document
         geometry = QApplication.primaryScreen().virtualGeometry()
-        head = {'rect': scene.screen_rect(), 'screen': [geometry.width(), geometry.height()], 'zoom': scene.canvas.zoomLevel(), 'name': os.path.basename(document.fileName()) or 'unsaved'}
+        window = scene.view.window().qwindow(); offset = scene.widget.mapTo(window, QPoint(0, 0))
+        head = {'rect': scene.screen_rect(), 'screen': [geometry.width(), geometry.height()],
+                'desktop': [geometry.x(), geometry.y(), geometry.width(), geometry.height()],
+                'native_window': int(window.winId()), 'pixel_ratio': float(window.devicePixelRatioF()),
+                'canvas_offset': [offset.x()+scene.rect.x(), offset.y()+scene.rect.y()],
+                'zoom': scene.canvas.zoomLevel(), 'name': os.path.basename(document.fileName()) or 'unsaved'}
         self.repaints.watch(scene.widget)
         if self.repaints.count != getattr(self, 'docked', None):   # not on idle polls
             if self.asking() is None: self.docked = self.repaints.count; self.docks()

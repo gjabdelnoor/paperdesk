@@ -15,7 +15,8 @@ def test_sticker_preserves_source_and_existing_destination(tmp_path):
     with zipfile.ZipFile(target) as archive:
         assert any(name.endswith(".rm") for name in archive.namelist())
         metadata = next(n for n in archive.namelist() if n.endswith(".metadata"))
-        assert json.loads(archive.read(metadata))["type"] == "DocumentType"
+        info = json.loads(archive.read(metadata))
+        assert info["type"] == "DocumentType" and info["visibleName"] == "sticker"
     saved = target.read_bytes()
     with pytest.raises(FileExistsError):
         create_sticker(str(source), str(target))

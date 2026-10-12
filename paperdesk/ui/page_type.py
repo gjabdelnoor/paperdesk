@@ -290,8 +290,10 @@ class TouchSurface(QWidget):
 class TypePage(Page):
     def __init__(self, win):
         super().__init__(win, "Type", "Write on the page that is open on the tablet.")
-        self._pending: list[tuple[str, str]] = []
+        self._pending: list[tuple[str, str, bool]] = []
         self._feeding = False
+        self._feeding_live = False
+        self._live_cancel_requested = False
         self.sections = Sections("Type sections")
         self.col.addWidget(self.sections, 1)
         self.sections.add("write", "Write", self._build_write())
@@ -356,9 +358,9 @@ class TypePage(Page):
                     "For typing straight onto the page. It is off until you start it and stops by itself "
                     "when you click anywhere else. Dead keys and input methods are not forwarded.")
         self.live = LiveCapture()
-        self.live.text.connect(lambda t: self.feed("text", t))
-        self.live.key.connect(lambda k: self.feed("key", k))
-        self.live.stopped.connect(self._live_changed)
+        self.live.text.connect(lambda t: self.feed("text", t, live=True))
+        self.live.key.connect(lambda k: self.feed("key", k, live=True))
+        self.live.stopped.connect(self._live_stopped)
         live.add(self.live)
         self.live_button = button("Start live keyboard", None, "Send each key press as you type")
         self.live_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
@@ -585,35 +587,58 @@ class TypePage(Page):
     def _live_changed(self) -> None:
         self.live_button.setText("Stop live keyboard" if self.live.live else "Start live keyboard")
 
-    def feed(self, kind: str, value: str) -> None:
+    def _live_stopped(self) -> None:
+        self._live_changed()
+        # Focus loss/Shift+Esc cannot flush stale captured keys into a later
+        # tablet control. Independently clicked on-screen keys stay separate.
+        self._pending = [item for item in self._pending if not item[2]]
+        if self._feeding_live:
+            self._live_cancel_requested = True
+            current = self.win.runner.current
+            if current is not None and current.name in ("live-type-key", "live-send-key"):
+                self.win.runner.cancel_current()
+                self.win.cancel_service_inputs()
+            self.win.runner.cancel_waiting(lambda job: job.name in ("live-type-key", "live-send-key"))
+
+    def stop_forwarding(self) -> None:
+        """Disconnect/close drops all pending input before signaling stop."""
+        self._pending.clear()
+        self.live.stop()
+
+    def feed(self, kind: str, value: str, *, live: bool = False) -> None:
         """Queue one key or some text; order is kept and a failure drops the rest."""
         if not self._can("keyboard", "keyboard forwarding"):
             return
-        if kind == "text" and self._pending and self._pending[-1][0] == "text":
-            self._pending[-1] = ("text", self._pending[-1][1] + value)
+        if kind == "text" and self._pending and self._pending[-1][0] == "text" and self._pending[-1][2] == live:
+            self._pending[-1] = ("text", self._pending[-1][1] + value, live)
         else:
-            self._pending.append((kind, value))
+            self._pending.append((kind, value, live))
         self._pump()
 
     def _pump(self) -> None:
-        if self._feeding or not self._pending:
+        if self._feeding or not self._pending or self.win.uncertain is not None:
             return
-        kind, value = self._pending.pop(0)
+        kind, value, live = self._pending.pop(0)
+        self._feeding_live = live
+        self._live_cancel_requested = False
         if kind == "text":
-            started = self.win.run("type-key", lambda s: s.type_text(value), mutation=True, dedupe=False,
+            started = self.win.run("live-type-key" if live else "type-key", lambda s: s.type_text(value), mutation=True, dedupe=False,
                                    label=f"Type {len(value)} character{'' if len(value) == 1 else 's'}",
                                    on_done=self._fed, on_error=self._feed_failed)
         else:
-            started = self.win.run("send-key", lambda s: s.send_key(value), mutation=True, dedupe=False,
+            started = self.win.run("live-send-key" if live else "send-key", lambda s: s.send_key(value), mutation=True, dedupe=False,
                                    label=f"Press {KEY_LABELS.get(value, value)}",
                                    on_done=self._fed, on_error=self._feed_failed)
         self._feeding = started
         if not started:
+            self._feeding_live = False
             self._pending.clear()
             self.live.stop()
 
     def _fed(self, result: Any) -> None:
         self._feeding = False
+        self._feeding_live = False
+        self._live_cancel_requested = False
         if isinstance(result, dict) and result.get("ok") is False:
             self._pending.clear()
             self.live.stop()
@@ -622,12 +647,21 @@ class TypePage(Page):
 
     def _feed_failed(self, _exc: BaseException) -> None:
         self._feeding = False
+        keep_clicked = self._feeding_live and self._live_cancel_requested
+        self._feeding_live = False
+        self._live_cancel_requested = False
         dropped = len(self._pending)
-        self._pending.clear()
+        if keep_clicked:
+            self._pending = [item for item in self._pending if not item[2]]
+            dropped -= len(self._pending)
+        else:
+            self._pending.clear()
         self.live.stop()
         if dropped:
             self.win.notify("warn", f"{dropped} later key press{'' if dropped == 1 else 'es'} "
                                     "were discarded and not sent, because the one before failed.")
+        if keep_clicked and self.win.uncertain is None:
+            self._pump()  # a live job cancelled before dispatch sent no input
 
     # -- clipboard, capture, pages, touch --------------------------------
     def paste_clipboard_image(self) -> None:

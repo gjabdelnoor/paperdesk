@@ -7,6 +7,7 @@
     "tablet/direct-paste/direct_paste.so": "e46cb160fff7e8cc2bec19621c31859d3c87ea7d39214ae505c05b8293e31357",
     "tablet/direct-paste/xovi.so": "064323582030dff61b55d673c71f2b4d0c45e1d3a4ace595dff9559b7a8f64b8",
     "art/pen-bridge": "baa1d52c28e8741f09a8ac8cfb839cd9370ffd77d6f58d3561e0de60ad305164",
-    "art/viewport/prebuilt/krita_viewport.so": "1cddb97bb7da723eff36c8a991a546939e7844bd5071c63e922520941cd0e854"
+    "art/viewport/prebuilt/krita_viewport.so": "1cddb97bb7da723eff36c8a991a546939e7844bd5071c63e922520941cd0e854",
+    "ink/stylus-injector-aarch64": "d7aa5546fa578be49aeba1a1e058adff9e0d348989874dcaad6033cd7f6131bc"
   }
 }

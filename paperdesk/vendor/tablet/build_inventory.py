@@ -13,6 +13,7 @@ PAYLOADS = (
     "tablet/direct-paste/xovi.so",
     "art/pen-bridge",
     "art/viewport/prebuilt/krita_viewport.so",
+    "ink/stylus-injector-aarch64",
 )
 
 

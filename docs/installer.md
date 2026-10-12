@@ -52,7 +52,7 @@ The current installation is a **real directory**, not a symlink:
 ```text
 paperdesk/
   current/manifest.json
-  current/bin/{injector,touch-injector,pen-bridge,recover-stock}
+  current/bin/{injector,touch-injector,figure-ink,pen-bridge,recover-stock}
   current/xovi.so
   current/extensions.d/direct_paste.so
   current/lib/krita_viewport.so
@@ -61,7 +61,9 @@ paperdesk/
   uninstalled-<transaction>/...
 ```
 
-Only selected helpers are present. Setup acquires an app-owned
+Only selected helpers are present. Keyboard setup on the exactly pinned Paper Pro
+also provisions the experimental ink helper; the pen check verifies it and never
+installs a helper implicitly. Setup acquires an app-owned
 `install.lock`, builds a unique `stage-<transaction>` directory, transfers
 files, verifies every transferred SHA256, checks the device again, retains
 the old `current` as `backup-<transaction>`, and atomically promotes staging.

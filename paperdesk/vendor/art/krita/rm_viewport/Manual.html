@@ -1,7 +1,7 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><title>PaperDesk reMarkable Viewport</title></head><body>
 <h1>reMarkable Viewport for PaperDesk</h1>
 <p>This optional Krita Python plugin serves the current canvas to PaperDesk's explicitly started art session. Enable it in Krita's Python Plugin Manager and restart Krita after saving your artwork.</p>
-<p>The plugin retains the tablet palette, eraser sizes, layer opacity, reference image docker and reference rotation controls. PaperDesk starts the sensor and tablet display session separately. Tablet display currently requires the supported Linux setup and the firmware-pinned Paper Pro extension.</p>
+<p>The plugin retains the tablet palette, eraser sizes, layer opacity, reference image docker and reference rotation controls. PaperDesk starts the sensor and tablet display session separately. Tablet display uses native Qt local IPC on Linux, macOS and Windows, plus the explicitly provisioned firmware-pinned Paper Pro extension. Physical panel validation is separate from local IPC tests.</p>
 <p>Copying the plugin never installs a tablet extension or changes permissions. The local server uses a user-only socket. Existing plugins are preserved unless you explicitly request replacement with a backup.</p>
 <p>Copyright PaperDesk contributors and the original remarkable-linux-desktop authors. Licensed under the GNU Affero General Public License, version 3 or later. There is no warranty. The license and corresponding source are distributed with PaperDesk.</p>
 </body></html>

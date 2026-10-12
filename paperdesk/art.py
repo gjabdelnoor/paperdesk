@@ -14,8 +14,10 @@ import threading
 import time
 from pathlib import Path
 
-from .paths import cache_root, resource_root, state_root
+from .paths import resource_root, state_root
 from .windows_ink import windows_ink_available
+from .native_pointer import mac_input_permission
+from .art_ipc import probe_krita, windows_server_name
 
 APPLICATIONS = {"krita": ("Krita", "org.kde.krita"),
                 "inkscape": ("Inkscape", "org.inkscape.Inkscape"),
@@ -145,12 +147,10 @@ def validate_options(options: dict | None, platform: str) -> dict:
         if not isinstance(screen, (list, tuple)) or len(screen) != 4 or not all(isinstance(n, (int, float)) and not isinstance(n, bool) and math.isfinite(n) for n in screen) or screen[2] <= 0 or screen[3] <= 0:
             raise ArtError("Screen rectangle must contain x, y, positive width and positive height.")
         defaults["screen_rect"] = list(screen)
-    if not platform.startswith("linux") and defaults["display"]:
-        raise ArtError("Tablet canvas display currently requires Linux. Windows Ink pen/touch input is separate from the canvas display.")
-    if platform == "darwin" and defaults["touch"]:
-        raise ArtError("macOS supports native pointer mode without touch or pressure.")
-    if platform == "win32" and defaults["touch"] and defaults["mode"] == "mouse":
-        raise ArtError("Touch requires Windows Ink pen mode; turn it off for mouse mode.")
+    if platform == "darwin" and defaults["touch"] and not defaults["display"]:
+        raise ArtError("macOS touch gestures control Krita while canvas display is on; native multi-touch input is unavailable.")
+    if platform == "win32" and defaults["touch"] and defaults["mode"] == "mouse" and not defaults["display"]:
+        raise ArtError("Mouse-mode touch gestures require Krita canvas display. Use Windows Ink for native multi-touch.")
     return defaults
 
 
@@ -165,6 +165,7 @@ class ArtManager:
         self._session = None
         self._sim_state = {"active": False, "application": "", "message": "Art mode is stopped."}
         self._probe = {}
+        self._plugin_info = {}
         self._launched = []
         self._lock = threading.RLock()
         self._message = "Art mode is stopped."
@@ -200,16 +201,21 @@ class ArtManager:
         backend = getattr(getattr(self._session, "output", None), "backend", "")
         if backend == "native-mouse": ink = False
         pen = native_ready or ink
+        mac_permission = self.platform == "darwin" and mac_input_permission()
+        canvas = native_ready or self.platform == "win32" or mac_permission
         return {"launch": True, "file_open": True, "pointer": self.platform in ("darwin", "win32") or native_ready,
-                "pressure": pen, "tilt": pen, "multitouch": pen,
-                "art_display": native_ready, "windows_ink_available": ink, "backend": backend,
+                "pressure": pen, "tilt": pen, "multitouch": pen or (canvas and self.platform == "darwin"),
+                "native_multitouch": pen, "canvas_gestures": canvas, "canvas_ipc": True,
+                "art_display": canvas, "mac_input_permission": mac_permission,
+                "display_verified": False, "plugin_ready": bool(self._plugin_info),
+                "display_validation": "Implemented; local IPC proof is recorded separately; physical panel validation pending", "windows_ink_available": ink, "backend": backend,
                 "experimental_pressure": self.platform == "darwin", "pressure_validation": "protocol-tested; physical target application validation pending",
                 "experimental_backend_active": backend == "quartz-pen-experimental",
                 "linux_driver_installed": evdev, "linux_input_permission": uinput,
                 "tablet_support": "Paper Pro 3.28.0.172 with the pinned xochitl build",
                 "pointer_only": self.platform == "darwin" or (self.platform == "win32" and not ink), "simulated": self.simulated,
                 "provisioned": bool(self._probe.get("helper_verified")),
-                "limits": "Windows Ink supports pressure/tilt/eraser and touch on Windows 10 1809+, with an explicit mouse fallback. Krita must use Windows 8+ Pointer Input. macOS defaults to native mouse input. Explicit pen mode uses experimental Quartz tablet packets with pressure/tilt; target app receipt is not yet verified. Native macOS multi-touch is unavailable. Tablet canvas display requires Linux. End-to-end physical tablet validation is pending for this release; older tablet art sensor layouts are not validated."}
+                "limits": "Windows Ink supports pressure/tilt/eraser and touch on Windows 10 1809+, with an explicit mouse fallback. Krita must use Windows 8+ Pointer Input. macOS defaults to native mouse input. Explicit pen mode uses experimental Quartz tablet packets with pressure/tilt; target app receipt is not yet verified. Native macOS multi-touch is unavailable; touch gestures can control Krita through the canvas bridge. Krita canvas display uses Qt local IPC on all three platforms and needs the verified tablet extension plus local input permission. End-to-end physical tablet validation is pending for this release; older tablet art sensor layouts are not validated."}
 
     def applications(self):
         capabilities = self.capabilities()
@@ -223,10 +229,24 @@ class ArtManager:
         return result
 
     def _socket(self):
+        if self.platform == "win32": return windows_server_name(self.home)
+        if self.platform == "darwin":
+            return self.home / "Library" / "Caches" / "PaperDesk" / "paperdesk-viewport.sock"
         argv = self._program("krita")
-        if self.platform.startswith("linux") and "run" in argv and APPLICATIONS["krita"][1] in argv:
+        if "run" in argv and APPLICATIONS["krita"][1] in argv:
             return self.home / ".var" / "app" / "org.kde.krita" / "cache" / "paperdesk-viewport.sock"
-        return cache_root() / "paperdesk-viewport.sock"
+        return Path(self.environ.get("XDG_CACHE_HOME", str(self.home / ".cache"))) / "PaperDesk" / "paperdesk-viewport.sock"
+
+    def probe_plugin(self):
+        """Explicit read-only local readiness check; no input or remote process."""
+        if self.simulated:
+            return {"ok": True, "simulated": True, "message": "Simulation: would check the Krita viewport plugin."}
+        try:
+            self._plugin_info = probe_krita(self._socket())
+        except (OSError, ValueError) as error:
+            self._plugin_info = {}
+            raise ArtError("Enable the current reMarkable Viewport plugin in Krita's Python Plugin Manager and restart Krita after saving your artwork. The local plugin did not answer its compatibility check.") from error
+        return dict(self._plugin_info)
 
     def open(self, application, path=""):
         _application(application)
@@ -249,7 +269,13 @@ class ArtManager:
         if application == "krita" and "run" not in argv:
             # Native Krita reads this optional socket override; flatpak uses its private cache.
             socket_path = self._socket()
-            socket_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.platform != "win32":
+                directory = Path(socket_path).parent
+                if directory.is_symlink(): raise ArtError("The PaperDesk viewport cache directory must not be a symbolic link.")
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if hasattr(os, "getuid") and directory.stat().st_uid != os.getuid():
+                    raise ArtError("The viewport cache directory is owned by another user.")
+                directory.chmod(0o700)
             env["RM_VIEWPORT_SOCKET"] = str(socket_path)
         if target:
             argv = [*argv, target]
@@ -318,8 +344,8 @@ printf 'touch_node='; test -r /dev/input/event3 && echo yes || echo no
                     raise ArtError("Linux art input needs writable /dev/uinput. Load the uinput kernel module and grant your user access using your distribution's udev rules. PaperDesk never runs as root or changes permissions automatically.")
             elif self.platform not in ("darwin", "win32"):
                 raise ArtError("Native art input is supported on Linux, macOS and Windows.")
-            if options["display"] and not self._socket().exists():
-                raise ArtError("Enable the reMarkable Viewport plugin in Krita's Python Plugin Manager and restart Krita yourself before starting canvas display.")
+            if options["display"]:
+                self.probe_plugin()
             from .art_runtime import ArtSession
             self._session = ArtSession(self.transport, self.platform, options, self._socket(), self._notify)
             try:

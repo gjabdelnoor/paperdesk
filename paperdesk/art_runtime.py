@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import threading
+import ctypes
+import math
 from pathlib import Path
 
 from .native_pointer import MacPointer, ScreenRect, WindowsPointer
@@ -13,12 +15,48 @@ HELPER_PATH = "/home/root/.local/lib/paperdesk/current/bin/pen-bridge"
 RUNTIME_ROOT = "/tmp/paperdesk-viewport"
 
 
+def canvas_rectangle(platform, rect, desktop, metadata, api=None):
+    """Map Krita's logical canvas rectangle to the native pointer coordinate space."""
+    if platform != "win32": return ScreenRect(*rect)
+    # Qt supplies the actual HWND and canvas offset inside its client area.
+    # ClientToScreen gives physical native coordinates even on mixed-DPI monitors.
+    window = metadata.get("native_window")
+    offset = metadata.get("canvas_offset")
+    ratio = metadata.get("pixel_ratio")
+    if (api is not None and hasattr(api, "ClientToScreen") and isinstance(window, int) and window > 0
+            and isinstance(offset, (list, tuple)) and len(offset) == 2
+            and all(isinstance(n, (int, float)) and math.isfinite(n) for n in offset)
+            and isinstance(ratio, (int, float)) and math.isfinite(ratio) and 0.1 <= ratio <= 16):
+        from .windows_ink import POINT
+        api.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.POINTER(POINT)]
+        api.ClientToScreen.restype = ctypes.c_int32
+        origin = POINT(0, 0)
+        if not api.ClientToScreen(window, ctypes.byref(origin)):
+            raise RuntimeError("Could not map Krita's native canvas window. Restart the art session after checking the plugin.")
+        return ScreenRect(origin.x+offset[0]*ratio, origin.y+offset[1]*ratio, rect[2]*ratio, rect[3]*ratio)
+    # Protocol fixtures/older callers can provide a uniform-DPI virtual desktop.
+    # The current plugin always provides native window metadata on Windows.
+    if api is not None and hasattr(api, "GetSystemMetrics"):
+        native = ScreenRect(*(api.GetSystemMetrics(n) for n in (76, 77, 78, 79)))
+        sx, sy = native.width/desktop[2], native.height/desktop[3]
+        return ScreenRect(native.x+(rect[0]-desktop[0])*sx, native.y+(rect[1]-desktop[1])*sy, rect[2]*sx, rect[3]*sy)
+    return ScreenRect(*rect)
+
+
+def canvas_uv(mapper, u, v, target):
+    if target is not None and mapper.region:
+        x, y, width, height = mapper.region
+        return (u-x)/width, (v-y)/height
+    return u, v
+
+
 class StreamProcess:
     """Small stream wrapper for the reused canvas protocol; never spawns a shell locally."""
     def __init__(self, remote):
         self.remote = remote
         self.stdin = self.stdout = self
         self.closed = False
+        self.io_lock = threading.RLock()
 
     def read(self, size=-1):
         return self.remote.read(size)
@@ -29,7 +67,8 @@ class StreamProcess:
     def write(self, data):
         if self.closed:
             raise OSError("Art transport stream closed.")
-        return self.remote.write(data)
+        with self.io_lock:
+            return self.remote.write(data)
 
     def flush(self):
         return self.remote.flush()
@@ -108,6 +147,7 @@ class MouseOutput:
         self.lock = threading.RLock()
         self.pointer = MacPointer(screen) if platform == "darwin" else WindowsPointer(screen)
         self.mapper = mapper
+        self.canvas_target = None
         self.x = self.y = 0
         self.down = False
         self.closed = False
@@ -129,7 +169,8 @@ class MouseOutput:
                 elif kind == t.EV_KEY and code in (t.BTN_TOOL_PEN, t.BTN_TOOL_RUBBER) and not value:
                     self.down, dirty = False, True
             if dirty:
-                self.pointer.send(self.x / self.mapper.span[0], self.y / self.mapper.span[1], self.down)
+                u, v = canvas_uv(self.mapper, self.x/self.mapper.span[0], self.y/self.mapper.span[1], self.canvas_target)
+                self.pointer.send(u, v, self.down)
 
     def release(self):
         with self.lock:
@@ -154,6 +195,7 @@ class WindowsInkOutput:
         self.pen = (pen_factory or WindowsInkPointer)(screen)
         self.touch = None
         self.closed = False
+        self.canvas_target = None
         self.x = self.y = self.pressure = self.tx = self.ty = 0
         self.down = self.pen_near = self.rubber_near = self.barrel = False
         self.slot, self.contacts = 0, {}
@@ -184,7 +226,8 @@ class WindowsInkOutput:
                 if kind == t.EV_ABS and code in axes: setattr(self, axes[code], value); dirty = True
                 elif kind == t.EV_KEY and code in keys: setattr(self, keys[code], bool(value)); dirty = True
             if dirty:
-                self.pen.send(self.x/self.mapper.span[0], self.y/self.mapper.span[1], self.down,
+                u, v = canvas_uv(self.mapper, self.x/self.mapper.span[0], self.y/self.mapper.span[1], self.canvas_target)
+                self.pen.send(u, v, self.down,
                               pressure=self.pressure, tilt_x=self.tx, tilt_y=self.ty,
                               eraser=self.rubber_near, barrel=self.barrel,
                               near=self.pen_near or self.rubber_near or self.down)
@@ -245,13 +288,13 @@ class ArtSession:
     def start(self):
         try:
             if self.platform.startswith("linux"):
-                self.output = LinuxOutput(self.mapper, self.gestures.mapper, self.options["touch"])
+                self.output = LinuxOutput(self.mapper, self.gestures.mapper, self.options["touch"] and not self.options["display"])
             else:
                 screen = ScreenRect(*self.options["screen_rect"]) if self.options.get("screen_rect") else None
                 from .windows_ink import windows_ink_available
                 ink = self.platform == "win32" and self.options["mode"] != "mouse" and windows_ink_available()
                 if ink:
-                    self.output = WindowsInkOutput(self.mapper, self.gestures.mapper, self.options["touch"], screen)
+                    self.output = WindowsInkOutput(self.mapper, self.gestures.mapper, self.options["touch"] and not self.options["display"], screen)
                 elif self.platform == "darwin" and self.options["mode"] == "pen":
                     from .quartz_pen import MacTabletPointer
                     self.output = WindowsInkOutput(self.mapper, self.gestures.mapper, False, screen, pen_factory=MacTabletPointer)
@@ -259,12 +302,13 @@ class ArtSession:
                 elif self.options["mode"] == "pen":
                     raise RuntimeError("Native pen mode is unavailable on this system. Choose mouse mode for pointer-only input.")
                 else:
-                    if self.options["touch"]: raise RuntimeError("Native touch needs Windows Ink. Turn touch off for mouse mode.")
+                    if self.options["touch"] and not self.options["display"]: raise RuntimeError("Native touch needs Windows Ink. Turn touch off for mouse mode, or enable Krita canvas display gestures.")
                     self.output = MouseOutput(self.platform, self.mapper, screen)
             if self.options["display"]:
                 self.mirror = CanvasMirror(self._stream, self.socket_path, self.stop_event, self.mapper.rotate,
                                            (self.mapper, self.gestures.mapper), lambda: self.pen_down,
-                                           auto=self.auto, refresh=self.options["refresh"], notify=self.notify)
+                                           auto=self.auto, refresh=self.options["refresh"], notify=self.notify,
+                                           on_geometry=self._canvas_geometry, on_error=self._mirror_error)
                 self.mirror.jpeg = self.options["jpeg"]
                 self.mirror.eraser = self.options.get("eraser")
                 size = [4320, 3240] if self.mapper.rotate in ("left", "right") else [3240, 4320]
@@ -279,6 +323,19 @@ class ArtSession:
         except BaseException:
             self.stop()
             raise
+
+    def _canvas_geometry(self, rect, desktop, metadata):
+        with self.output.lock:
+            self.mapper.region = ((rect[0]-desktop[0])/desktop[2], (rect[1]-desktop[1])/desktop[3], rect[2]/desktop[2], rect[3]/desktop[3])
+            if not self.platform.startswith("linux"):
+                pointer = getattr(self.output, "pointer", None) or getattr(self.output, "pen", None)
+                if pointer:
+                    target = canvas_rectangle(self.platform, rect, desktop, metadata, pointer.api)
+                    pointer.screen = self.output.canvas_target = target
+
+    def _mirror_error(self, message):
+        self.error = message
+        self.stop()
 
     def _sensor(self, label, node, handle, release):
         grab = "-" if self.options["echo"] else "g"

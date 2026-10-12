@@ -19,7 +19,8 @@
     "Authenticated transport streams with explicit lifecycle and input release.",
     "Runtime tablet files isolated in /tmp/paperdesk-viewport.",
     "Portable Krita plugin socket paths, bounded requests and frames; dev execution hook removed.",
-    "Strip binaries and prefix-map SDK/source build paths."
+    "Strip binaries and prefix-map SDK/source build paths.",
+    "Cross-platform Qt local IPC client, protocol compatibility ping, private Unix socket directories and per-user Windows pipe names; native canvas-origin/DPI mapping."
   ],
   "artifacts": {
     "pen-bridge": {

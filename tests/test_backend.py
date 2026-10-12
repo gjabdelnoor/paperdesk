@@ -1,7 +1,13 @@
 """Suite API checks against disposable simulation and mocked native transport."""
 import hashlib
+import contextlib
+import http.client
+import io
 import json
+import re
+import threading
 import time
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -19,6 +25,7 @@ def physical_mock(tmp_path):
     service = SuiteService(DeviceConfig(host="test-tablet.invalid", state_dir=tmp_path / "state", password="memory-only-fixture"))
     service._connected = True
     service.transport = Mock(connected=True)
+    service.transport.exists.return_value = False
     service._installer = Mock()
     service._installer.probe.return_value = {"model":"paper-pro", "firmware":FIRMWARE, "xochitl_sha256":XOCHITL_SHA256}
     return service
@@ -310,3 +317,195 @@ def test_ink_simulation_has_explicit_check_and_bounded_records(tmp_path):
     service.simulate_reboot()
     with pytest.raises(DeviceError,match="Check the pen"):
         service.stream_ink(strokes)
+
+
+def pdf_fixture():
+    import pymupdf
+    with pymupdf.open() as document:
+        document.new_page().insert_text((40,40),"PaperDesk synthetic export fixture")
+        return document.tobytes()
+
+
+def export_response(service, payload, declared_length=None):
+    class Socket:
+        def makefile(self, *_args):
+            count = len(payload) if declared_length is None else declared_length
+            return io.BytesIO(f"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: {count}\r\n\r\n".encode()+payload)
+    response = http.client.HTTPResponse(Socket()); response.begin()
+    connection = Mock(); connection.getresponse.return_value = response
+    @contextlib.contextmanager
+    def web_connection(**_options):
+        yield connection
+    service.transport.web_connection = web_connection
+
+
+def test_native_export_validates_transfer_and_pdf_without_repair(tmp_path):
+    service = physical_mock(tmp_path)
+    payload = pdf_fixture(); export_response(service,payload)
+    target = tmp_path / "complete.pdf"
+    assert service._export(DOCUMENT,str(target),"Synthetic")["ok"]
+    assert target.read_bytes() == payload
+
+
+@pytest.mark.parametrize("kind",["declared-short-body","missing-eof","repaired-xref"])
+def test_native_export_rejects_truncated_or_repaired_pdf_and_removes_own_output(tmp_path,kind):
+    service = physical_mock(tmp_path)
+    payload = pdf_fixture(); length = None
+    if kind == "declared-short-body":
+        payload = b"%PDF-1.4\ntruncated"; length = 1000
+    elif kind == "missing-eof":
+        payload = payload[:payload.rfind(b"%%EOF")]
+    else:
+        payload = re.sub(br"startxref\n[0-9]+",b"startxref\n1",payload)
+    export_response(service,payload,length)
+    target = tmp_path / "new-export.pdf"
+    original = tmp_path / "original.pdf"; original.write_bytes(b"preserved original")
+    with pytest.raises(DeviceError,match="truncated|incomplete|corrupt|repair"):
+        service._export(DOCUMENT,str(target),"Synthetic")
+    assert not target.exists()
+    assert original.read_bytes() == b"preserved original"
+
+
+def test_cancel_long_typing_stops_promptly_and_never_replays_partial_text(tmp_path):
+    service = physical_mock(tmp_path)
+    started = threading.Event()
+    class Stream:
+        closed = False
+        channel = Mock()
+        writes = 0
+        def write(self,_data):
+            self.writes += 1; started.set()
+        def close(self): self.closed = True
+    stream = Stream(); service._keyboard = stream
+    failures = []
+    def run():
+        try: service.type_text("x"*100000)
+        except Exception as error: failures.append(error)
+    thread = threading.Thread(target=run); thread.start()
+    assert started.wait(1)
+    before = time.monotonic(); assert service.cancel_current()["ok"]
+    thread.join(1)
+    assert not thread.is_alive() and time.monotonic()-before < 1
+    assert stream.writes == 1 and stream.closed
+    assert len(failures) == 1 and isinstance(failures[0],UnknownMutation) and failures[0].no_retry
+    with pytest.raises(DeviceError,match="cancelled"):
+        service.type_text("same text")
+    assert stream.writes == 1
+    service.begin_job()
+    with pytest.raises(UnknownMutation,match="previous input"):
+        service.type_text("new text requires explicit reconnect after inspection")
+
+
+def test_begin_job_cannot_clear_stop_flag_while_input_job_running(tmp_path):
+    service = physical_mock(tmp_path)
+    with service._input_job():
+        service.cancel_current()
+        with pytest.raises(DeviceError,match="current input"):
+            service.begin_job()
+        assert service._cancel_event.is_set()
+    service.begin_job()
+    assert not service._cancel_event.is_set()
+
+
+def test_global_cancel_combines_with_ink_caller_stop(tmp_path):
+    service = SuiteService.demo(tmp_path / "tablet")
+    service.probe_ink()
+    def progressed(number,_total):
+        if number == 1: service.cancel_current()
+    with pytest.raises(UnknownMutation) as error:
+        service.stream_ink([[(1000,1000),(1500,1500)]],cancelled=lambda:False,progress=progressed)
+    assert error.value.no_retry
+    service.begin_job()
+    with pytest.raises(UnknownMutation):
+        service.stream_ink([[(1000,1000),(1500,1500)]],cancelled=lambda:True)
+
+
+def test_ink_unsafe_paths_refused_before_provisioning(tmp_path,monkeypatch):
+    service = physical_mock(tmp_path)
+    service._installer.probe.return_value["unsafe_paths"] = True
+    helper = Mock(side_effect=AssertionError("Helper was provisioned"))
+    monkeypatch.setattr("paperdesk.figure_tools.probe_ink",helper)
+    with pytest.raises(DeviceError,match="symlink"):
+        service.probe_ink()
+    assert not helper.called and not service.transport.write_bytes.called
+
+
+def native_fixture(path,title="Embedded native title",ident=INSTANCE):
+    with zipfile.ZipFile(path,"w",compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(ident+".metadata",json.dumps({"visibleName":title,"type":"DocumentType"}))
+        archive.writestr(ident+".content",'{}')
+    return path
+
+
+def test_rmdoc_import_uses_bounded_embedded_title_for_new_document_receipt(tmp_path):
+    service = physical_mock(tmp_path)
+    source = native_fixture(tmp_path / "different-file-name.rmdoc")
+    before = document_inventory()
+    after = before | document_inventory("Embedded native title",INSTANCE)
+    service._inventory = Mock(side_effect=[before,after])
+    service._web_select = Mock(); service._web_post_file = Mock()
+    result = service.upload(str(source))
+    assert result["ok"] and result["id"] == INSTANCE
+    assert service._web_post_file.call_count == 1
+    journal = json.loads((service.state_dir / "uploads.json").read_text())
+    assert "Embedded native title" in journal["operations"][0]["expected_names"]
+
+
+def test_rmdoc_existing_identifier_refused_before_post_or_folder_select(tmp_path):
+    service = physical_mock(tmp_path)
+    source = native_fixture(tmp_path / "copy.rmdoc",ident=DOCUMENT)
+    service._inventory = Mock(return_value=document_inventory("Existing original"))
+    service._web_select = Mock(); service._web_post_file = Mock()
+    with pytest.raises(DeviceError,match="preserve the existing"):
+        service.upload(str(source))
+    assert not service._web_post_file.called and not service._web_select.called
+
+
+def test_rmdoc_archive_traversal_and_oversized_metadata_are_refused(tmp_path):
+    service = physical_mock(tmp_path)
+    service._web_post_file = Mock()
+    source = tmp_path / "unsafe.rmdoc"
+    for metadata_name,title in (("../"+INSTANCE+".metadata","title"),(INSTANCE+".metadata","x"*(1024*1024+1))):
+        with zipfile.ZipFile(source,"w",compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(metadata_name,json.dumps({"visibleName":title}))
+        with pytest.raises(DeviceError,match="native metadata"):
+            service.upload(str(source))
+    assert not service._web_post_file.called
+
+
+def test_operation_journals_are_scoped_to_tablet_endpoint_and_verified_key(tmp_path):
+    common = tmp_path / "common-state"
+    first = SuiteService(DeviceConfig(host="tablet-a.invalid",state_dir=common))
+    second = SuiteService(DeviceConfig(host="tablet-b.invalid",state_dir=common))
+    assert first.state_dir != second.state_dir
+    source = tmp_path / "reading.pdf"; source.write_bytes(b"%PDF-1.4\nsynthetic")
+    for service in (first,second):
+        service._connected = True
+        service.transport = Mock(connected=True)
+        service._inventory = Mock(return_value=document_inventory())
+        service._web_select = Mock(); service._web_post_file = Mock(side_effect=ConnectionError())
+        with pytest.raises(UnknownMutation): service.upload(str(source))
+        assert service._web_post_file.call_count == 1
+    observed = "SHA256:"+"A"*43
+    for service in (first,second):
+        service.transport.host_fingerprint = observed
+        service.status = Mock(return_value={"connected":True})
+        service.connect()
+    assert first.state_dir == second.state_dir
+    assert first.state_dir.parent == common / "devices"
+    assert first.state_dir.name.startswith("ssh-")
+    assert not (common / "uploads.json").exists()
+
+
+def test_legacy_unscoped_unknown_journal_preserved_and_never_replayed(tmp_path):
+    service = physical_mock(tmp_path)
+    legacy = service._state_base / "uploads.json"
+    legacy.parent.mkdir(parents=True,exist_ok=True)
+    original = json.dumps({"version":1,"operations":[{"state":"unknown"}]})
+    legacy.write_text(original)
+    source = tmp_path / "reading.pdf"; source.write_bytes(b"%PDF-1.4\nsynthetic")
+    service._web_post_file = Mock()
+    with pytest.raises(UnknownMutation,match="unscoped"):
+        service.upload(str(source))
+    assert not service._web_post_file.called
+    assert legacy.read_text() == original

@@ -15,6 +15,7 @@ import os
 import re
 import socket
 import stat
+import threading
 import time
 import uuid
 from pathlib import Path, PurePosixPath
@@ -217,11 +218,13 @@ class RemoteStream:
         self.closed = True
         try:
             self.channel.shutdown_write()
-        except (OSError, EOFError):
+        except (OSError, EOFError, paramiko.SSHException):
             pass
-        self.stdin.close()
-        self.stdout.close()
-        self.channel.close()
+        for item in (self.stdin, self.stdout, self.channel):
+            try:
+                item.close()
+            except (OSError, EOFError, paramiko.SSHException):
+                pass
 
     def __enter__(self):
         return self
@@ -241,8 +244,11 @@ class SSHTransport:
         validate_config(config)
         self.config = config
         self.client = None
+        self.host_fingerprint = ""
         self._sftp = None
         self._streams: list[RemoteStream] = []
+        self._streams_lock = threading.RLock()
+        self._web_channels: list[paramiko.Channel] = []
 
     @property
     def connected(self) -> bool:
@@ -252,6 +258,10 @@ class SSHTransport:
         return bool(session and session.is_active() and session.is_authenticated())
 
     def connect(self) -> None:
+        if self.connected:
+            return
+        if self.client is not None:
+            self.close()
         expected = _load_trust(self.config).get(_host_id(self.config))
         if not expected:
             raise HostTrustRequired("This tablet is not paired. Observe its SSH fingerprint and confirm trust before connecting.")
@@ -275,11 +285,10 @@ class SSHTransport:
             client.close()
             raise DeviceError("Cannot connect over SSH. Check developer mode, the tablet address, and the cable or network.") from exc
         self.client = client
+        self.host_fingerprint = fingerprint(client.get_transport().get_remote_server_key())
 
     def close(self) -> None:
-        for stream in self._streams:
-            stream.close()
-        self._streams.clear()
+        self.cancel_streams()
         if self._sftp is not None:
             self._sftp.close()
             self._sftp = None
@@ -288,6 +297,22 @@ class SSHTransport:
             self.client = None
 
     disconnect = close
+
+    def cancel_streams(self) -> None:
+        """Close owned live input/web channels without disconnecting SSH.
+
+        Closing the channel unblocks bounded reads/writes in the worker. It
+        never launches a remote command or retries an interrupted mutation.
+        """
+        with self._streams_lock:
+            streams, web = list(self._streams), list(self._web_channels)
+            self._streams.clear()
+            self._web_channels.clear()
+        for item in streams + web:
+            try:
+                item.close()
+            except (OSError, EOFError, paramiko.SSHException):
+                pass
 
     def _session(self):
         if not self.connected:
@@ -349,7 +374,10 @@ class SSHTransport:
                 raise UnknownMutation("The SSH connection was lost during a possible change. Inspect the tablet before any further setup; the command will not be replayed.") from exc
             raise DeviceError("The SSH connection was interrupted. Inspect any in-progress action before retrying.") from exc
         finally:
-            channel.close()
+            try:
+                channel.close()
+            except (OSError, EOFError, paramiko.SSHException):
+                pass
 
     def stream(self, script: str, timeout: float = 30) -> RemoteStream:
         if not isinstance(script, str) or not script or "\x00" in script:
@@ -359,8 +387,9 @@ class SSHTransport:
         try:
             channel.exec_command(script)
             stream = RemoteStream(channel)
-            self._streams = [item for item in self._streams if not item.closed]
-            self._streams.append(stream)
+            with self._streams_lock:
+                self._streams = [item for item in self._streams if not item.closed]
+                self._streams.append(stream)
             return stream
         except (OSError, EOFError, paramiko.SSHException) as exc:
             channel.close()
@@ -371,7 +400,7 @@ class SSHTransport:
     def list_dir(self, path: str) -> list[str]:
         try:
             return self._files().listdir(validate_remote_path(path))
-        except OSError as exc:
+        except (OSError, EOFError, paramiko.SSHException, paramiko.SFTPError) as exc:
             raise DeviceError("Cannot read the tablet directory. Check its connection and permissions.") from exc
 
     def exists(self, path: str) -> bool:
@@ -385,6 +414,8 @@ class SSHTransport:
             if exc.errno == 2:
                 return False
             raise DeviceError("Cannot inspect the tablet path.") from exc
+        except (EOFError, paramiko.SSHException, paramiko.SFTPError) as exc:
+            raise DeviceError("Cannot inspect the tablet path because the SSH connection was interrupted.") from exc
 
     def read_bytes(self, path: str) -> bytes:
         path = validate_remote_path(path)
@@ -394,7 +425,7 @@ class SSHTransport:
             if len(data) > self.MAX_READ:
                 raise DeviceError("Remote file is too large for a metadata read; use streamed download.")
             return data
-        except OSError as exc:
+        except (OSError, EOFError, paramiko.SSHException, paramiko.SFTPError) as exc:
             raise DeviceError("Cannot read the tablet file. Check its connection and installation.") from exc
 
     def _check_write(self, path: str) -> str:
@@ -414,6 +445,8 @@ class SSHTransport:
                 if exc.errno == 2:
                     continue
                 raise DeviceError("Cannot verify the tablet write path.") from exc
+            except (EOFError, paramiko.SSHException, paramiko.SFTPError) as exc:
+                raise DeviceError("Cannot verify the tablet write path because SSH was interrupted.") from exc
             if stat.S_ISLNK(info.st_mode):
                 raise DeviceError("Writing through a tablet symlink is refused.")
         return path
@@ -431,18 +464,26 @@ class SSHTransport:
             files.chmod(temporary, mode)
             try:
                 files.posix_rename(temporary, path)
-            except (AttributeError, OSError):
+            except (AttributeError, OSError) as rename_error:
+                if isinstance(rename_error, socket.timeout):
+                    raise
+                if isinstance(rename_error, OSError) and (
+                        rename_error.errno not in (None, 38, 95) or
+                        rename_error.errno is None and not any(word in str(rename_error).lower() for word in ("unsupported", "not supported"))):
+                    raise
                 # SFTP v3 rename cannot replace. Never delete the target to
                 # fake replacement: losing the link at that point is unsafe.
                 if self.exists(path):
                     raise DeviceError("Tablet lacks atomic replacement support; existing file preserved.")
                 files.rename(temporary, path)
+        except (EOFError, paramiko.SSHException, paramiko.SFTPError, socket.timeout) as exc:
+            raise UnknownMutation("The tablet file transfer lost its receipt. A change may have happened; inspect the installation or native request before retrying.") from exc
         except OSError as exc:
             raise DeviceError("Tablet file transfer failed; inspect the installation before retrying.") from exc
         finally:
             try:
                 files.remove(temporary)
-            except OSError:
+            except (OSError, EOFError, paramiko.SSHException, paramiko.SFTPError):
                 pass
 
     def download(self, remote: str, destination: Path) -> int:
@@ -469,7 +510,7 @@ class SSHTransport:
             return total
         except FileExistsError as exc:
             raise DeviceError("That destination already exists. Choose a new filename to preserve the original.") from exc
-        except OSError as exc:
+        except (OSError, EOFError, paramiko.SSHException, paramiko.SFTPError) as exc:
             if created:
                 destination.unlink(missing_ok=True)
             raise DeviceError("Download interrupted; no complete copy was saved.") from exc
@@ -481,6 +522,8 @@ class SSHTransport:
         connection = None
         try:
             channel = self._session().open_channel("direct-tcpip", ("10.11.99.1", 80), ("127.0.0.1", 0), timeout=10)
+            with self._streams_lock:
+                self._web_channels.append(channel)
             channel.settimeout(timeout)
             connection = http.client.HTTPConnection("10.11.99.1", 80, timeout=timeout)
             connection.sock = channel
@@ -492,3 +535,6 @@ class SSHTransport:
                 connection.close()
             elif channel is not None:
                 channel.close()
+            with self._streams_lock:
+                if channel in self._web_channels:
+                    self._web_channels.remove(channel)

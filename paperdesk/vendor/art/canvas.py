@@ -5,10 +5,10 @@
 """Krita canvas display protocol, rotation, palette, eraser and gesture handling."""
 import json
 import math
-import socket
 import threading
 import time
 from .transforms import PANEL, orientation
+from ...art_ipc import KritaIPC
 
 
 def valid_frame_header(head):
@@ -28,10 +28,12 @@ class CanvasMirror:
     go down one SSH stream into the tablet's /tmp. When that stream ends for any reason the
     tablet's own screen comes back within five seconds.
     """
-    def __init__(self, start_stream, socket_path, stop_event, rotate, mappers, pen_down, auto=False, refresh=30, notify=None):
+    def __init__(self, start_stream, socket_path, stop_event, rotate, mappers, pen_down, auto=False, refresh=30, notify=None, on_geometry=None, on_error=None):
         self.start_stream, self.socket_path, self.stop_event = start_stream, socket_path, stop_event
         self.mappers, self.mapper, self.pen_down = mappers, mappers[0], pen_down
         self.notify = notify or (lambda message: None)
+        self.on_geometry = on_geometry
+        self.on_error = on_error or (lambda message: None)
         self.lock = threading.Lock(); self.queue = threading.Lock(); self.zones = []; self.zoned = None; self.krita = None; self.feed = None; self.have = None; self.sent = 0; self.state = ''
         self.pending = None; self.wake = threading.Event(); self.refresh = refresh; self.dirty = False; self.active = 0.0; self.erase = self.erased = False; self.eraser = None; self.jpeg = False
         self.taps = []; self.start = None; self.flashed = 0.0; self.framed = 0.0; self.rubbed = self.urgent = False
@@ -66,20 +68,12 @@ class CanvasMirror:
             if self.stop_event.is_set(): return {'idle': 'Art mode stopped'}, b''
             try:
                 if not self.krita:
-                    self.krita = socket.socket(socket.AF_UNIX); self.krita.settimeout(10); self.krita.connect(str(self.socket_path)); self.reader = self.krita.makefile('rb')
-                sock = self.krita
-                sock.sendall(json.dumps(request).encode()+b'\n')
-                line = self.reader.readline(65537)
-                if len(line) > 65536: raise ValueError('Krita reply exceeded its limit')
-                head = json.loads(line)
-                if not isinstance(head, dict): raise ValueError('Invalid Krita reply')
-                size = head.get('size', 0)
-                if not isinstance(size, int) or not 0 <= size <= 40_000_000: raise ValueError('Invalid Krita frame size')
-                return head, self.reader.read(size)
+                    self.krita = KritaIPC(self.socket_path, self.stop_event)
+                return self.krita.request(request)
             except (OSError, ValueError):
                 if self.krita: self.krita.close()
-                if getattr(self, 'reader', None): self.reader.close()
-                self.krita = None; return {'idle': 'Krita is not running with the reMarkable Viewport plugin'}, b''
+                self.krita = None
+                return {'idle': 'Krita is not running with the compatible reMarkable Viewport plugin'}, b''
     def say(self, state):
         if state != self.state: self.state = state; self.notify(state)
     def tablet(self, name, data=b''):
@@ -118,6 +112,18 @@ class CanvasMirror:
             self.pending = step
         self.wake.set()
     def run(self):
+        try:
+            self._run()
+        except Exception as error:
+            self.say(f'Canvas display stopped: {type(error).__name__}. Check the viewport plugin.')
+            self.on_error(self.state)
+        finally:
+            # The Qt local socket belongs to this thread. A stop request only
+            # sets a cancellation event; destruction happens here.
+            if self.krita:
+                self.krita.close(); self.krita = None
+
+    def _run(self):
         beat = 0; due = 0
         while not self.stop_event.is_set():
             self.wake.wait(0.1); self.wake.clear()
@@ -152,21 +158,21 @@ class CanvasMirror:
             if not isinstance(raw_zones, list): raw_zones = []
             self.zones = [tuple(z) for z in raw_zones[:1000] if isinstance(z, (list, tuple)) and len(z) == 3 and all(isinstance(n, (int, float)) and math.isfinite(n) for n in z)]
             if self.have and (self.zones, self.rotate) != self.zoned and self.tablet('zn', self.zone_file() or b'\n'): self.zoned = (self.zones, self.rotate)
-            (x, y, w, h), (sw, sh) = head['rect'], head['screen']; self.mapper.region = (x/sw, y/sh, w/sw, h/sh)
+            (x, y, w, h), (sw, sh) = head['rect'], head['screen']
+            desktop = head.get('desktop', [0, 0, sw, sh])
+            if not isinstance(desktop, (list, tuple)) or len(desktop) != 4 or not all(isinstance(n, (int, float)) and math.isfinite(n) for n in desktop) or desktop[2] <= 0 or desktop[3] <= 0:
+                raise ValueError('Invalid Krita desktop geometry')
+            if self.on_geometry: self.on_geometry(head['rect'], desktop, head)
+            else: self.mapper.region = ((x-desktop[0])/desktop[2], (y-desktop[1])/desktop[3], w/desktop[2], h/desktop[3])
             if body:
                 self.sent += 1   # frame names are unique across sessions: the tablet reloads only on a new name
                 if self.tablet(f"f{int(time.time()*1000) % 10**12}.{'jpg' if head.get('format') == 'jpg' else 'png'}", body): self.have = head['hash']; beat = now; self.dirty = self.dirty or self.sent > 1; self.framed = now; self.urgent = self.urgent or self.rubbed; self.rubbed = self.erase; self.say(f"on · {head.get('name', 'canvas')} · tablet shows the canvas")
     def close(self):
-        self.wake.set()
-        if self.krita:
-            try: self.krita.shutdown(socket.SHUT_RDWR)
-            except OSError: pass
-            self.krita.close()
-            self.krita = None
+        self.stop_event.set(); self.wake.set()
+        if self.thread is not threading.current_thread(): self.thread.join(3)
         if self.feed and self.feed.poll() is None:
             try: self.tablet('bye')
-            except OSError: pass
+            except (OSError, RuntimeError): pass
             self.feed.close()
-        self.thread.join(3)
-        if self.sense_thread: self.sense_thread.join(3)
+        if self.sense_thread and self.sense_thread is not threading.current_thread(): self.sense_thread.join(3)
         self.mapper.region = None

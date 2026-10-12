@@ -99,6 +99,7 @@ def test_flatpak_discovery_only_reads_files(tmp_path, monkeypatch):
     flatpak.chmod(0o700)
     (tmp_path / "data" / "flatpak" / "app" / "org.kde.krita").mkdir(parents=True)
     monkeypatch.setattr("subprocess.run", Mock(side_effect=AssertionError("discovery must not run commands")))
+    monkeypatch.setattr("paperdesk.art.shutil.which", lambda name, path=None: str(flatpak) if name == "flatpak" else None)
     assert find_program("krita", platform="linux", home=tmp_path, environ={"PATH": str(tmp_path), "XDG_DATA_HOME": str(tmp_path / "data")}) == [str(flatpak), "run", "org.kde.krita"]
 
 
@@ -114,12 +115,16 @@ def test_art_options_fail_before_native_actions(options):
 
 
 @pytest.mark.parametrize("platform", ["darwin", "win32"])
-def test_non_linux_pressure_limits_are_explicit(tmp_path, platform):
+def test_non_linux_pressure_limits_are_explicit(tmp_path, monkeypatch, platform):
     m = manager(tmp_path, platform=platform)
+    monkeypatch.setattr("paperdesk.art.windows_ink_available", lambda: False)
+    monkeypatch.setattr("paperdesk.art.mac_input_permission", lambda: False)
     caps = m.capabilities()
     assert caps["pointer_only"] and caps["pointer"]
-    assert not caps["pressure"] and not caps["tilt"] and not caps["multitouch"] and not caps["art_display"]
-    with pytest.raises(ArtError, match="canvas display"):
+    assert not caps["pressure"] and not caps["tilt"] and not caps["native_multitouch"]
+    assert caps["canvas_ipc"] and not caps["display_verified"]
+    assert validate_options({"display": True}, platform)["display"]
+    with pytest.raises(ArtError, match="Pair and connect"):
         m.start(options={"display": True})
 
 

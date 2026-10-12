@@ -117,6 +117,17 @@ class CGRect(ctypes.Structure):
     _fields_ = [("origin", CGPoint), ("size", CGSize)]
 
 
+def mac_input_permission() -> bool:
+    """Read-only event-posting permission check; never prompts or emits events."""
+    if sys.platform != "darwin": return False
+    try:
+        api = ctypes.CDLL(ctypes.util.find_library("CoreGraphics") or "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        check = api.CGPreflightPostEventAccess
+        check.argtypes = []; check.restype = ctypes.c_bool
+        return bool(check())
+    except (OSError, AttributeError): return False
+
+
 class MacPointer:
     """Post Quartz mouse events, with an explicit Accessibility permission gate."""
     def __init__(self, screen: ScreenRect | None = None, *, graphics=None, foundation=None):

@@ -156,3 +156,16 @@ def test_wrong_model_architecture_never_installs_arm64_on_rm2(setup):
     sim,installer=setup;sim._state["model"]="rm2";sim._state["architecture"]="aarch64"
     with pytest.raises(InstallerError,match="before changes"):installer.install(["keyboard"])
     assert not any(event["action"]=="write" for event in sim.operations)
+
+
+@pytest.mark.parametrize("path", [LOADER_CONF, RECOVERY_UNIT])
+def test_first_install_preserves_unowned_runtime_files(setup, path):
+    sim, installer = setup
+    original = b"Unrelated configuration must be preserved\n"
+    sim.write_bytes(path, original)
+    sim.operations.clear()
+    assert not installer.plan(["keyboard", "direct-paste"])["compatible"]
+    with pytest.raises(InstallerError, match="before changes"):
+        installer.install(["keyboard", "direct-paste"])
+    assert sim.read_bytes(path) == original
+    assert not any(event["action"] == "write" for event in sim.operations)

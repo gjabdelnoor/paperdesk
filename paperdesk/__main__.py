@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -44,8 +45,18 @@ def main(argv=None) -> int:
     window.show()
     failures = []
     if args.smoke_test:
+        deadline = time.monotonic() + 12
         def finish():
+            if (not getattr(window, "connected", False)
+                    and getattr(window, "runner", None) is not None
+                    and window.runner.busy and time.monotonic() < deadline):
+                QTimer.singleShot(100, finish)
+                return
             try:
+                if args.screenshot:
+                    args.screenshot.parent.mkdir(parents=True, exist_ok=True)
+                    if not window.grab().save(str(args.screenshot)):
+                        raise RuntimeError("Could not save GUI screenshot")
                 if not window.isVisible():
                     raise RuntimeError("The application window is not visible")
                 if getattr(window, "connection_mode", None) != "simulation":
@@ -54,15 +65,20 @@ def main(argv=None) -> int:
                     raise RuntimeError("The simulated tablet is disconnected")
                 if getattr(window, "status", {}).get("simulated") is not True:
                     raise RuntimeError("The simulator did not report an isolated connection")
-                if args.screenshot:
-                    args.screenshot.parent.mkdir(parents=True, exist_ok=True)
-                    if not window.grab().save(str(args.screenshot)):
-                        raise RuntimeError("Could not save GUI screenshot")
                 print(json.dumps({"ok": True, "platform": sys.platform,
                                   "gui": "Qt Widgets", "simulated": True}))
             except Exception as exc:
                 failures.append(str(exc))
-                print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+                diagnostic = {"ok": False, "error": str(exc),
+                              "backend_error": getattr(window, "backend_error", ""),
+                              "connect_error": getattr(window, "connect_error", ""),
+                              "connection_mode": getattr(window, "connection_mode", "unknown"),
+                              "activity": window.status_text() if callable(getattr(window, "status_text", None)) else "",
+                              "recent_log": getattr(window, "log", [])[-5:]}
+                if args.screenshot:
+                    args.screenshot.with_suffix(".json").write_text(json.dumps(diagnostic, indent=2) + "\n")
+                if sys.stderr is not None:
+                    print(json.dumps(diagnostic), file=sys.stderr)
             finally:
                 window.close()
                 app.quit()

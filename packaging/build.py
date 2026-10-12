@@ -8,6 +8,26 @@ import sys
 import shutil
 import zipfile
 import importlib.util
+import importlib.metadata
+
+
+def copy_dependency_licenses(destination: Path):
+    destination.mkdir(parents=True, exist_ok=True)
+    for package in ("PySide6-Essentials", "shiboken6", "paramiko", "Pillow", "PyMuPDF",
+                    "platformdirs", "portalocker", "cryptography", "bcrypt", "PyNaCl", "cffi", "evdev"):
+        try:
+            distribution = importlib.metadata.distribution(package)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        for relative in distribution.files or []:
+            name = str(relative)
+            if (".dist-info/" in name and any(word in name.lower() for word in ("license", "copying", "notice"))):
+                source = Path(distribution.locate_file(relative))
+                if source.is_file():
+                    tail = Path(name.split(".dist-info/", 1)[1])
+                    target = destination / package / tail
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
 
 
 def main():
@@ -29,6 +49,7 @@ def main():
     command.append(str(root / "packaging" / "entry.py"))
     subprocess.run(command, cwd=root, check=True)
     bundle = root / "dist" / ("PaperDesk.app" if sys.platform == "darwin" else "PaperDesk")
+    copy_dependency_licenses(bundle / ("Contents/Resources/licenses" if sys.platform == "darwin" else "licenses"))
     for filename in ("LICENSE", "THIRD_PARTY_NOTICES.md", "README.md"):
         target = bundle / ("Contents/Resources" if sys.platform == "darwin" else ".")
         shutil.copy2(root / filename, target / filename)

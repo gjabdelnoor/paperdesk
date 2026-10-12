@@ -116,8 +116,8 @@ class DeviceInstaller:
         if observed["unsafe_paths"]:
             supported = {feature: False for feature in supported}; reasons = {feature: "An installation path is a symlink. Resolve it manually before setup." for feature in reasons}
         denied = [{"feature": feature, "reason": reasons[feature]} for feature in requested if not supported[feature]]
-        if observed["owned_loader"] and not observed["installed"]:
-            denied.append({"feature": "loader", "reason": "An existing PaperDesk-named loader has no ownership manifest; it will not be replaced."})
+        if not observed["installed"] and any(self.transport.exists(path) for path in (LOADER_CONF, RECOVERY_UNIT)):
+            denied.append({"feature": "loader", "reason": "Existing PaperDesk-named runtime configuration has no ownership manifest; it will not be replaced."})
         return {"device": observed, "features": requested, "supported": supported, "compatibility": reasons, "compatible": not denied,
                 "unsupported": denied, "changes": [f"Stage checksum-verified files under {APP_ROOT}.", "Retain the previous app installation as a rollback backup."] +
                 (["Install app-owned current-boot loader and crash recovery in /run; restart xochitl once and verify a fresh heartbeat."] if any(feature in requested for feature in ("direct-paste", "art-display")) else []),
@@ -133,7 +133,7 @@ class DeviceInstaller:
             data = resource.read_bytes()
             key=resource.relative_to(self.resources).as_posix()
             if inventory.get(key)!=hashlib.sha256(data).hexdigest():raise InstallerError(f"Packaged tablet helper checksum failed: {name}. Inspect rebuild changes before updating the artifact inventory.")
-            if name.endswith((".so", "injector", "pen-bridge")):
+            if name.endswith((".so", "injector", "pen-bridge", "figure-ink")):
                 expected = 183 if device["architecture"] == "aarch64" else 40
                 if not data.startswith(b"\x7fELF") or int.from_bytes(data[18:20], "little") != expected:
                     raise InstallerError(f"Packaged helper has the wrong ELF architecture: {name}.")
@@ -141,6 +141,9 @@ class DeviceInstaller:
         arch = "aarch64" if device["architecture"] == "aarch64" else "armv7l"
         if "keyboard" in features: add("bin/injector", self.resources / "tablet/bin" / f"injector-{arch}", 0o700)
         if "touch" in features: add("bin/touch-injector", self.resources / "tablet/bin/touch-injector-aarch64", 0o700)
+        if ("keyboard" in features and device["model"] == "paper-pro"
+                and device["firmware"] == PINNED_FIRMWARE and device["xochitl_sha256"] == PINNED_SHA256):
+            add("bin/figure-ink", self.resources / "ink/stylus-injector-aarch64", 0o700)
         advanced = "direct-paste" in features or "art-display" in features
         preloads = []
         if "direct-paste" in features:
@@ -172,7 +175,10 @@ systemctl start xochitl.service
 
     def _verify_manifest(self):
         manifest_path = APP_ROOT + "/current/manifest.json"
-        if not self.transport.exists(manifest_path): return None
+        if not self.transport.exists(manifest_path):
+            if any(self.transport.exists(path) for path in (LOADER_CONF, RECOVERY_UNIT)):
+                raise InstallerError("Unowned app-named runtime configuration is preserved; setup is refused.")
+            return None
         try: manifest = json.loads(self.transport.read_bytes(manifest_path))
         except (ValueError, UnicodeError) as exc: raise InstallerError("Existing PaperDesk manifest is invalid. Restore it from a backup before modifying setup.") from exc
         if manifest.get("owner") != "paperdesk" or manifest.get("schema") != 1 or not isinstance(manifest.get("files"), dict):
